@@ -9,8 +9,8 @@ ASIMOV or Asymmetric Secure Isomorphic Verification is Face Detection & Recognit
 The installation is relatively simple, as there is no need to first create the models or convert them to the SavedModel format. 
 
 ```bash
-git clone https://github.com/JamesPiggott/ASIMOV-Face-Detection-Recognition.git
-cd ASIMOV-Face-Detection-Recognition
+git clone https://github.com/JamesPiggott/ASIMOV.git
+cd ASIMOV
 ```
 
 ### CUDA
