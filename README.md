@@ -38,7 +38,7 @@ pip install -r requirements.txt
 python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
 ```
 
-### CUDA on Windows 10 / 11
+#### CUDA on Windows 10 / 11
 
 Installation on Windows can be more problematic as for the CUDA drivers, toolkit and cuDNN libraries specific versions need to be used. There is an excellent article online, see link to [towardsdatascience](https://towardsdatascience.com/setting-up-tensorflow-gpu-with-cuda-and-anaconda-onwindows-2ee9c39b5c44) that specifies the procedure step-by-step. A simple alternative is to install the packages using conda. Install Microsoft Visual C++ Redistributable and Anaconda. Open `Anaconda Prompt` and enter the following commands:
 
