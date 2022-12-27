@@ -1,6 +1,6 @@
-# [ASIMOV-Face-Detection-Recognition](https://github.com/JamesPiggott/ASIMOV-Face-Detection-Recognition)
+# [ASIMOV](https://github.com/JamesPiggott/ASIMOV)
 
-![License](https://img.shields.io/github/license/JamesPiggott/ASIMOV-Face-Detection-Recognition)
+![License](https://img.shields.io/github/license/JamesPiggott/ASIMOV)
 
 ASIMOV or Asymmetric Secure Isomorphic Verification is Face Detection & Recognition application built using Python 3 and TensorFlow 2.0. It uses the latest versions of RetinaFace and ArcFace for detection and recognition. This repository is a trial version of the larger ASIMOV project and is intended for feedback and debugging.
 
