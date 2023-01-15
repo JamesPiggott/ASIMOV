@@ -1,6 +1,6 @@
-# [ASIMOV-Face-Detection-Recognition](https://github.com/JamesPiggott/ASIMOV-Face-Detection-Recognition)
+# [ASIMOV](https://github.com/JamesPiggott/ASIMOV)
 
-![License](https://img.shields.io/github/license/JamesPiggott/ASIMOV-Face-Detection-Recognition)
+![License](https://img.shields.io/github/license/JamesPiggott/ASIMOV)
 
 ASIMOV or Asymmetric Secure Isomorphic Verification is Face Detection & Recognition application built using Python 3 and TensorFlow 2.0. It uses the latest versions of RetinaFace and ArcFace for detection and recognition. This repository is a trial version of the larger ASIMOV project and is intended for feedback and debugging.
 
@@ -9,8 +9,8 @@ ASIMOV or Asymmetric Secure Isomorphic Verification is Face Detection & Recognit
 The installation is relatively simple, as there is no need to first create the models or convert them to the SavedModel format. 
 
 ```bash
-git clone https://github.com/JamesPiggott/ASIMOV-Face-Detection-Recognition.git
-cd ASIMOV-Face-Detection-Recognition
+git clone https://github.com/JamesPiggott/ASIMOV.git
+cd ASIMOV
 ```
 
 ### CUDA
@@ -38,7 +38,7 @@ pip install -r requirements.txt
 python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
 ```
 
-### CUDA on Windows 10 / 11
+#### CUDA on Windows 10 / 11
 
 Installation on Windows can be more problematic as for the CUDA drivers, toolkit and cuDNN libraries specific versions need to be used. There is an excellent article online, see link to [towardsdatascience](https://towardsdatascience.com/setting-up-tensorflow-gpu-with-cuda-and-anaconda-onwindows-2ee9c39b5c44) that specifies the procedure step-by-step. A simple alternative is to install the packages using conda. Install Microsoft Visual C++ Redistributable and Anaconda. Open `Anaconda Prompt` and enter the following commands:
 
