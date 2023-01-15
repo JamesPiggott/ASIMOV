@@ -1,4 +1,4 @@
-tensorflow~=2.10.0
-numpy~=1.18.5
-opencv-python~=4.5.5.62
-
+tensorflow~=2.6.0
+numpy~=1.19.5
+opencv-python~=4.5.4.58
+Pillow~=8.4.0
