@@ -1,7 +1,7 @@
 import cv2
 from src.API import API
 
-video = cv2.VideoCapture('test/sample_videos/vikander.mp4')
+video = cv2.VideoCapture('sample_videos/vikander.mp4')
 
 api = API()
 
