@@ -1,8 +1,5 @@
-import pathlib
-
-from src.api.detection.retinaface.DetectionProcessing import DetectionProcessing
-from src.api.recognition.arcface.RecognitionProcessing import RecognitionProcessing
 from src import Settings
+from src.utilities.config_parser import Configure
 
 
 class API:
@@ -24,8 +21,15 @@ class API:
 
     """
     def __init__(self):
-        self.detector = DetectionProcessing(Settings.location_retina_face_model)
-        self.recognition = RecognitionProcessing(Settings.location_arcface_model)
+        configuration = Configure()
+
+        if configuration.perform_detection:
+            from src.api.detection.retinaface.DetectionProcessing import DetectionProcessing
+            self.detector = DetectionProcessing(Settings.location_retina_face_model)
+
+        if configuration.perform_recognition:
+            from src.api.recognition.arcface.RecognitionProcessing import RecognitionProcessing
+            self.recognition = RecognitionProcessing(Settings.location_arcface_model)
 
     def detect_faces(self, frame, draw_bounding_box):
         """Detects coordinates within the image corresponding to human faces
