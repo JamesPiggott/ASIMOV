@@ -13,9 +13,12 @@ git clone https://github.com/JamesPiggott/ASIMOV.git
 cd ASIMOV
 ```
 
+Afterwards install the required libraries defined in 'requirements.txt' using pip. Then check out the sample script 
+located in the 'test' folder.
+
 ### CUDA
 
-For the application to run optimally you will need to make use of a NVIDIA CUDA enabled GPU.  
+However, for the application to run optimally you will need to make use of a NVIDIA CUDA enabled GPU.  
 
 #### CUDA on Linux
 
@@ -45,17 +48,34 @@ Installation on Windows can be more problematic as for the CUDA drivers, toolkit
 ```bash
 conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0
 python -m pip install "tensorflow<2.10"
+pip install -r requirements.txt
 
 # Verify install:
 python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
 ```
 
+Note the specific requirement that the TensorFlow version should not exceed 2.9.
+
 ## Testing
 
-There are several Python scripts built around the API intended for testing. These can be used as the basis for any application of your own. The first is `video_detection_test.py` which tests face detection using RetinaFace. The second is `webcam_test.py` which does almost the same but uses as input your webcam. Finally, there is `image_recognition_test.py` which is a more comprehensive suite that tests cropping, alignment and face comparison. The latter of course uses the ArcFace model to create the necessary face vectors for comparison.
+There are several Python scripts built around the API intended for testing. These can be used as the basis for any 
+application of your own. The first is `video_detection_test.py` which tests face detection using RetinaFace on a 
+sample video. The second is `webcam_test.py` which does almost the same but uses as input your webcam. Finally, there 
+is `image_recognition_test.py` which is a more comprehensive suite that tests cropping, alignment and face comparison. The latter of course uses the ArcFace model to create the necessary face vectors for comparison.
 
 ```bash
 python video_detection_test.py
 python webcam_test.py
 python image_recognition_test.py
 ```
+
+## References
+
+The following resources were invaluable for creating the ASIMOV implementation, of which this repository is but a small 
+sample. Regardless, credit should go to where it is due, as such my thanks to the maintainers of the following 
+GitHub repo's.
+
+- https://github.com/peteryuX/retinaface-tf2
+    - RetinaFace for TensorFlow 2.0
+- https://github.com/peteryuX/arcface-tf2
+    - ArcFace for TensorFlow 2.0
