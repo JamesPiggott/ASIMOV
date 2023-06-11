@@ -15,3 +15,8 @@ location_retina_face_model = str(pathlib.Path().resolve()) + "/../src/api/detect
 
 # Location of the face recognition model
 location_arcface_model = str(pathlib.Path().resolve()) + "/../src/api/recognition/arcface/"
+
+# PostgreSQL database
+user_name = "face"
+password = "face"
+database_name = 'face_vector_db'
