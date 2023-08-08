@@ -1,14 +1,20 @@
-import cv2
+import pathlib
+
+import cv2 as cv2
+import tensorflow as tf
 
 from src.API import API
 
 api = API()
 
 # Load the slightly misaligned image of the actress
-frame = cv2.imread('test/sample_images/scarlett_johansson.jpg')
+frame = cv2.imread(str(pathlib.Path("sample_images/alicia_vikander.jpg")))
 result = api.detect_faces(frame, True)
 
 # Test face vectors
-print("Length of face vector is: " + str(api.recognize_faces(result.faces[0].get_crop())))
+val = api.recognize_faces(result.faces[0].get_crop())
+tensor = tf.add(val, 1)
+
+print("The transformed tensor into a numpy array is= ", api.recognize_faces(result.faces[0].get_crop()).numpy()[0])
 
 # TODO https://www.rathishkumar.in/2021/03/face-recognition-euclidean-distance-sql.html
