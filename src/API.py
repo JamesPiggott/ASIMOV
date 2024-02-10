@@ -21,13 +21,13 @@ class API:
 
     """
     def __init__(self):
-        configuration = Configure()
+        self.configuration = Configure()
 
-        if configuration.perform_detection:
+        if self.configuration.perform_detection:
             from src.api.detection.retinaface.DetectionProcessing import DetectionProcessing
             self.detector = DetectionProcessing(Settings.location_retina_face_model)
 
-        if configuration.perform_recognition:
+        if self.configuration.perform_recognition:
             from src.api.recognition.arcface.RecognitionProcessing import RecognitionProcessing
             self.recognition = RecognitionProcessing(Settings.location_arcface_model)
 
