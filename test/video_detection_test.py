@@ -12,8 +12,7 @@ video = cv.VideoCapture('sample_videos/vikander.mp4')
 
 api = API()
 
-configuration = api.get_configuration()
-configuration.perform_recognition(False)
+configuration = api.configuration
 
 while video.isOpened():
     ret, frame = video.read()
