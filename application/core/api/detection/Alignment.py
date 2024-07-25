@@ -1,75 +1,73 @@
 import math
-
 import numpy as np
 from PIL import Image
+from application.core.api.result.Face import Face
 
 
-def find_euclidean_distance(source_representation, test_representation):
+def find_euclidean_distance(source_representation: np.ndarray, test_representation: np.ndarray) -> float:
     """
-    Calculate Euclidean distance between points
-    :param source_representation:
-    :param test_representation:
-    :return:
+    Calculate Euclidean distance between points.
+
+    Args:
+        source_representation (np.ndarray): Source representation coordinates.
+        test_representation (np.ndarray): Test representation coordinates.
+
+    Returns:
+        float: Euclidean distance between the two representations.
     """
-    euclidean_distance = source_representation - test_representation
-    euclidean_distance = np.sum(np.multiply(euclidean_distance, euclidean_distance))
-    euclidean_distance = np.sqrt(euclidean_distance)
+    euclidean_distance = np.linalg.norm(source_representation - test_representation)
     return euclidean_distance
 
 
-def alignment_procedure(face):
+def alignment_procedure(face: Face) -> np.ndarray:
     """
-    This function aligns a face on the vertical axis based on the coordinates of the eyes.
+    Align a face on the vertical axis based on the coordinates of the eyes.
 
-    Original implementation found @ https://github.com/serengil/deepface/blob/master/deepface/commons/functions.py
-    :param face: Face class
-    :return:
+    Args:
+        face (Face): Face class instance containing face landmarks and crop information.
+
+    Returns:
+        np.ndarray: Aligned face image.
     """
-
-    # Left eye is actually for the person in the image their right eye
     img = face.get_crop()
     nose = face.get_landmarks().nose
+    left_eye = face.get_landmarks().left_eye
+    right_eye = face.get_landmarks().right_eye
 
-    left_eye_x, left_eye_y = face.get_landmarks().left_eye.get_horizontal(), face.get_landmarks().left_eye.get_vertical()
-    right_eye_x, right_eye_y = face.get_landmarks().right_eye.get_horizontal(), face.get_landmarks().right_eye.get_vertical()
-
-    left_eye = (left_eye_x, left_eye_y)
-    right_eye = (right_eye_x, right_eye_y)
-    nose = (nose.get_horizontal(), nose.get_vertical())
+    left_eye_coord = (left_eye.get_horizontal(), left_eye.get_vertical())
+    right_eye_coord = (right_eye.get_horizontal(), right_eye.get_vertical())
+    nose_coord = (nose.get_horizontal(), nose.get_vertical())
 
     # Calculate the center between coordinates (x and y) between the eyes
-    center_eyes = (int((left_eye_x + right_eye_x) / 2), int((left_eye_y + right_eye_y) / 2))
+    center_eyes = (int((left_eye_coord[0] + right_eye_coord[0]) / 2), int((left_eye_coord[1] + right_eye_coord[1]) / 2))
 
-    # find rotation direction
-    if left_eye_y > right_eye_y:
-        point_3rd = (right_eye_x, left_eye_y)
+    # Find rotation direction
+    if left_eye_coord[1] > right_eye_coord[1]:
+        point_3rd = (right_eye_coord[0], left_eye_coord[1])
         direction = -1  # rotate clockwise
     else:
-        point_3rd = (left_eye_x, right_eye_y)
+        point_3rd = (left_eye_coord[0], right_eye_coord[1])
         direction = 1  # rotate anti-clockwise
 
-    # find length of triangle edges
-    a = find_euclidean_distance(np.array(left_eye), np.array(point_3rd))
-    b = find_euclidean_distance(np.array(right_eye), np.array(point_3rd))
-    c = find_euclidean_distance(np.array(right_eye), np.array(left_eye))
+    # Find length of triangle edges
+    a = find_euclidean_distance(np.array(left_eye_coord), np.array(point_3rd))
+    b = find_euclidean_distance(np.array(right_eye_coord), np.array(point_3rd))
+    c = find_euclidean_distance(np.array(right_eye_coord), np.array(left_eye_coord))
 
-    # apply cosine rule
+    # Apply cosine rule
     if b != 0 and c != 0:
-
         cos_a = (b * b + c * c - a * a) / (2 * b * c)
-        cos_a = min(1.0, max(-1.0, cos_a))
+        cos_a = np.clip(cos_a, -1.0, 1.0)
+        angle = np.degrees(np.arccos(cos_a))
 
-        angle = np.arccos(cos_a)  # angle in radian
-        angle = (angle * 180) / math.pi  # radian to degree
-
-        # rotate base image
+        # Rotate base image
         if direction == -1:
             angle = 90 - angle
 
         img = Image.fromarray(img)
         img = np.array(img.rotate(direction * angle))
 
-        if center_eyes[1] > nose[1]:
+        if center_eyes[1] > nose_coord[1]:
             img = Image.fromarray(img)
             img = np.array(img.rotate(180))
 

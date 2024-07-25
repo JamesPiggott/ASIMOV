@@ -1,69 +1,72 @@
 import cv2
-
 from application.core.API import API
-from application.core.api.detection.Alignment import *
+from application.core.api.detection.Alignment import alignment_procedure
 
-api = API()
 
-# Detect Scarlett Johansson's face, and save the crop
-frame1 = cv2.imread('test/sample_images/scarlett_johansson.jpg')
-result1 = api.detect_faces(frame1, True)
-cv2.imwrite("test/sample_images/scarlett_crop.jpg", result1.faces[0].get_crop())
+def save_face_crop(image_path, output_path, api):
+    frame = cv2.imread(image_path)
+    if frame is None:
+        raise FileNotFoundError(f"Image file not found at {image_path}")
 
-# Create another crop of Scarlett Johansson
-frame2 = cv2.imread('test/sample_images/scarlett_johansson2.jpg')
-result2 = api.detect_faces(frame2, True)
-cv2.imwrite("test/sample_images/scarlett_crop2.jpg", result2.faces[0].get_crop())
+    result = api.detect_faces(frame, True)
+    if not result.faces:
+        raise ValueError(f"No faces detected in the image at {image_path}")
 
-# Create another crop of Scarlett Johansson
-frame3 = cv2.imread('test/sample_images/scarlett22.jpg')
-result3 = api.detect_faces(frame3, True)
-cv2.imwrite("test/sample_images/scarlett22_crop.jpg", result3.faces[0].get_crop())
+    crop = result.faces[0].get_crop()
+    cv2.imwrite(output_path, crop)
+    return result.faces[0]
 
-# Detect Alicia Vikander's face, and save the crop
-frame4 = cv2.imread('test/sample_images/alicia_vikander.jpg')
-result4 = api.detect_faces(frame4, True)
-cv2.imwrite("test/sample_images/alicia_crop.jpg", result4.faces[0].get_crop())
 
-# Detect Alicia lookalike face, and save the crop
-frame5 = cv2.imread('test/sample_images/alicia_lookalike.JPG')
-result5 = api.detect_faces(frame5, True)
-cv2.imwrite("test/sample_images/alicia_lookalike_crop.jpg", result5.faces[0].get_crop())
+def compare_and_print(api, description, crop1, crop2):
+    distance = api.compare_faces(crop1, crop2)
+    print(f"{description} : {distance}")
 
-# Detect Michael Fassbender's face, and save the crop
-frame6 = cv2.imread('test/sample_images/michael_fassbender.jpg')
-result6 = api.detect_faces(frame6, True)
-cv2.imwrite("test/sample_images/michael_crop.jpg", result6.faces[0].get_crop())
 
-# Compare the same crops
-print("Scarlett 2 times the same            :   " + str(api.compare_faces(result1.faces[0].get_crop(), result1.faces[0].get_crop())))
+def main():
+    api = API()
 
-# Compare two different crops of the same person
-print("Scarlett 2 times different           :   " + str(api.compare_faces(result1.faces[0].get_crop(), result2.faces[0].get_crop())))
-aligned1 = alignment_procedure(result1.faces[0])
-aligned2 = alignment_procedure(result2.faces[0])
-print("Scarlett 2 times different aligned   :   " + str(api.compare_faces(aligned1, aligned2)))
+    # Save face crops
+    face1 = save_face_crop('sample_images/scarlett_johansson.jpg', 'sample_images/scarlett_crop.jpg', api)
+    face2 = save_face_crop('sample_images/scarlett_johansson2.jpg', 'sample_images/scarlett_crop2.jpg', api)
+    face3 = save_face_crop('sample_images/scarlett22.jpg', 'sample_images/scarlett22_crop.jpg', api)
+    face4 = save_face_crop('sample_images/alicia_vikander.jpg', 'sample_images/alicia_crop.jpg', api)
+    face5 = save_face_crop('sample_images/alicia_lookalike.JPG', 'sample_images/alicia_lookalike_crop.jpg',
+                           api)
+    face6 = save_face_crop('sample_images/michael_fassbender.jpg', 'sample_images/michael_crop.jpg', api)
 
-# Compare crops of Scarlett Johansson
-print("Scarlett 2 times different           :   " + str(api.compare_faces(result1.faces[0].get_crop(), result3.faces[0].get_crop())))
-aligned1 = alignment_procedure(result1.faces[0])
-aligned2 = alignment_procedure(result3.faces[0])
-print("Scarlett 2 times different aligned   :   " + str(api.compare_faces(aligned1, aligned2)))
+    # Compare the same crops
+    compare_and_print(api, "Scarlett 2 times the same", face1.get_crop(), face1.get_crop())
 
-# Compare crops of two women
-print("Scarlett + Alicia                    :   " + str(api.compare_faces(result1.faces[0].get_crop(), result4.faces[0].get_crop())))
-aligned1 = alignment_procedure(result1.faces[0])
-aligned2 = alignment_procedure(result4.faces[0])
-print("Scarlett + Alicia aligned            :   " + str(api.compare_faces(aligned1, aligned2)))
+    # Compare two different crops of the same person
+    compare_and_print(api, "Scarlett 2 times different", face1.get_crop(), face2.get_crop())
+    aligned1 = alignment_procedure(face1)
+    aligned2 = alignment_procedure(face2)
+    compare_and_print(api, "Scarlett 2 times different aligned", aligned1, aligned2)
 
-# Compare of man and woman
-print("Michael + Alicia                     :   " + str(api.compare_faces(result4.faces[0].get_crop(), result6.faces[0].get_crop())))
-aligned1 = alignment_procedure(result4.faces[0])
-aligned2 = alignment_procedure(result6.faces[0])
-print("Michael + Alicia aligned             :   " + str(api.compare_faces(aligned1, aligned2)))
+    # Compare different crops of Scarlett Johansson
+    compare_and_print(api, "Scarlett 2 times different", face1.get_crop(), face3.get_crop())
+    aligned1 = alignment_procedure(face1)
+    aligned2 = alignment_procedure(face3)
+    compare_and_print(api, "Scarlett 2 times different aligned", aligned1, aligned2)
 
-# Compare of Alicia Vikander with her lookalike
-print("Alicia + lookalike                   :   " + str(api.compare_faces(result4.faces[0].get_crop(), result5.faces[0].get_crop())))
-aligned1 = alignment_procedure(result4.faces[0])
-aligned2 = alignment_procedure(result5.faces[0])
-print("Alicia + lookalike aligned           :   " + str(api.compare_faces(aligned1, aligned2)))
+    # Compare crops of Scarlett Johansson and Alicia Vikander
+    compare_and_print(api, "Scarlett + Alicia", face1.get_crop(), face4.get_crop())
+    aligned1 = alignment_procedure(face1)
+    aligned2 = alignment_procedure(face4)
+    compare_and_print(api, "Scarlett + Alicia aligned", aligned1, aligned2)
+
+    # Compare Alicia Vikander with Michael Fassbender
+    compare_and_print(api, "Michael + Alicia", face4.get_crop(), face6.get_crop())
+    aligned1 = alignment_procedure(face4)
+    aligned2 = alignment_procedure(face6)
+    compare_and_print(api, "Michael + Alicia aligned", aligned1, aligned2)
+
+    # Compare Alicia Vikander with her lookalike
+    compare_and_print(api, "Alicia + lookalike", face4.get_crop(), face5.get_crop())
+    aligned1 = alignment_procedure(face4)
+    aligned2 = alignment_procedure(face5)
+    compare_and_print(api, "Alicia + lookalike aligned", aligned1, aligned2)
+
+
+if __name__ == "__main__":
+    main()
