@@ -1,35 +1,36 @@
 # [ASIMOV](https://github.com/JamesPiggott/ASIMOV)
 
 ![License](https://img.shields.io/github/license/JamesPiggott/ASIMOV)
+![Build Status](https://img.shields.io/github/actions/workflow/status/JamesPiggott/ASIMOV/ci.yml)
 
-ASIMOV or Asymmetric Secure Isomorphic Verification is a Face Detection & Recognition application built using Python 3 and TensorFlow 2.0. It uses the latest versions of RetinaFace and ArcFace for detection and recognition. This repository is a trial version of the larger ASIMOV project and is intended for feedback and debugging.
+ASIMOV (Asymmetric Secure Isomorphic Verification) is a Face Detection & Recognition application built using Python 3 and TensorFlow 2.0. It leverages the latest versions of RetinaFace and ArcFace for detection and recognition. This repository is a trial version of the larger ASIMOV project, intended for feedback and debugging.
 
 ## Installation
 
-The installation is relatively simple, as there is no need to first create the models or convert them to the SavedModel format. 
+The installation is relatively simple, as there is no need to first create the models or convert them to the SavedModel format.
 
 ```bash
 git clone https://github.com/JamesPiggott/ASIMOV.git
 cd ASIMOV
 ```
 
-Afterwards install the required libraries defined in 'requirements.txt' using pip. Then check out the sample script 
-located in the 'test' folder.
+Afterwards, install the required libraries defined in requirements.txt using pip. Then check out the sample script located in the test folder.
 
 ### CUDA
 
-However, for the application to run optimally you will need to make use of a NVIDIA CUDA enabled GPU.  
+For the application to run optimally, you will need to use an NVIDIA CUDA-enabled GPU.
 
 #### CUDA on Linux
 
-Linux is straightforward, it requires python, pip and Miniconda. For the complete procedure read the guide on [TensorFlow.org](https://www.tensorflow.org/install/pip).
+Linux installation requires Python, pip, and Miniconda. For the complete procedure, read the guide on [TensorFlow.org](https://www.tensorflow.org/install/pip).
 
 ```bash
 curl https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o Miniconda3-latest-Linux-x86_64.sh
 bash Miniconda3-latest-Linux-x86_64.sh
 
-# Create virtual env
+# Create virtual environment
 conda create --name asimov python=3.10
+conda activate asimov
 ```
 
 ```bash
@@ -46,8 +47,10 @@ python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU')
 Installation on Windows can be more problematic as for the CUDA drivers, toolkit and cuDNN libraries specific versions need to be used. There is an excellent article online, see link to [Towards Data Science](https://towardsdatascience.com/setting-up-tensorflow-gpu-with-cuda-and-anaconda-onwindows-2ee9c39b5c44) that specifies the procedure step-by-step. A simple alternative is to install the packages using conda. Install Microsoft Visual C++ Redistributable and Anaconda. Open `Anaconda Prompt` and enter the following commands:
 
 ```bash
+conda create --name asimov python=3.10
+conda activate asimov
 conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0
-python -m pip install "tensorflow<2.10"
+pip install "tensorflow<2.10"
 pip install -r requirements.txt
 
 # Verify install:
@@ -62,6 +65,7 @@ There are several Python scripts built around the API intended for testing. Thes
 application of your own. The first is `video_detection_test.py` which tests face detection using RetinaFace on a 
 sample video. The second is `webcam_test.py` which does almost the same but uses as input your webcam. Finally, there 
 is `image_recognition_test.py` which is a more comprehensive suite that tests cropping, alignment and face comparison. The latter of course uses the ArcFace model to create the necessary face vectors for comparison.
+Finally, there is also GUI.py which is located in the core module. It is an interactive layer on top of the API.
 
 ```bash
 python video_detection_test.py
