@@ -1,4 +1,7 @@
-tensorflow==2.10.0
-numpy
-opencv-python
-Pillow
+# ASIMOV - Python 3.13
+# Verified working on Windows 11, November 2026
+
+tensorflow==2.20.0
+numpy==2.5.4
+opencv-python==5.0.0.93
+Pillow==13.0.0
