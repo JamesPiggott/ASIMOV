@@ -1,17 +1,16 @@
-import pathlib
+from pathlib import Path
 
 """
-Settings class defines the values of important variables within the application, NOT the API
+Settings defines internal ASIMOV configuration values.
 
-Values include the locations of the models and model parameters
-
-Settings is not to be confused with config.ini with which users can alter the API configuration
-
-These values are provided as static variables.
+These settings are independent of the current working directory
+and should not be confused with the user-facing config.ini.
 """
 
-# Location of the face detection model
-location_retina_face_model = str(pathlib.Path().resolve()) + "/../core/api/detection/retinaface/"
+# Directory containing this Settings.py file
+CORE_DIRECTORY = Path(__file__).resolve().parent
 
-# Location of the face recognition model
-location_arcface_model = str(pathlib.Path().resolve()) + "/../core/api/recognition/arcface/"
+# Locations of the TensorFlow SavedModels
+location_retina_face_model = CORE_DIRECTORY / "api" / "detection" / "retinaface" / "mbv2_model"
+
+location_arcface_model = CORE_DIRECTORY / "api" / "recognition" / "arcface" / "arcface"

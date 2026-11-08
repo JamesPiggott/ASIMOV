@@ -18,9 +18,9 @@ class RecognitionProcessing:
         Initialize the RecognitionProcessing with the location of the model.
 
         Args:
-            model_location (str): Path to the directory containing the arcface model.
+            model_location: Path to the ArcFace SavedModel directory.
         """
-        self.model = tf.saved_model.load(model_location + 'arcface')
+        self.model = tf.saved_model.load(str(model_location))
 
     def l2_norm(self, x: np.ndarray, axis: int = 1) -> np.ndarray:
         """

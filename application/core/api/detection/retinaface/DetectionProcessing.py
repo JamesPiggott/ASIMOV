@@ -13,7 +13,7 @@ class DetectionProcessing:
     """
 
     def __init__(self, model_location: str):
-        self.model = tf.saved_model.load(model_location + 'mbv2_model')
+        self.model = tf.saved_model.load(str(model_location))
 
     def pad_input_image(self, img: 'np.ndarray', max_steps: int) -> ('np.ndarray', tuple):
         """
