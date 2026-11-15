@@ -1,45 +1,57 @@
 # ASIMOV
 
-> 📌 **Project status update (November 2026)**  
-> ASIMOV is being revisited after a period of inactivity. The initial focus is on reviewing the original implementation, updating its dependencies and documentation, and establishing a reliable baseline before further development.
+**ASIMOV** is an experimental face detection and recognition project built with Python, TensorFlow, RetinaFace, and ArcFace. It provides a reusable inference API and **Asimov Studio**, a desktop application for exploring video-based face detection, reference-image matching, and recognition diagnostics.
 
-> Experimental face detection and recognition using Deep Learning, with RetinaFace for detection and ArcFace for facial representation and comparison.
+The project is under active development. Its emphasis is on transparent experimentation: inspecting individual recognition results, comparing reference photographs, and building reproducible performance benchmarks rather than treating a match as definitive identification.
 
-ASIMOV is a Python-based face detection and recognition project built around **TensorFlow 2**, **RetinaFace**, and **ArcFace**. The repository contains an experimental implementation of the detection and recognition components of a larger project.
+## Overview
 
-The goal is to provide a straightforward interface for detecting faces in images, generating facial representations, and comparing faces, while keeping the underlying models accessible for experimentation.
+ASIMOV separates two stages of the pipeline:
 
-The original implementation includes:
+- **RetinaFace** detects faces and their landmarks in an image or video frame.
+- **ArcFace** produces facial embeddings that can be compared with embeddings from registered reference images.
 
-- Face detection and bounding-box annotation
-- Face recognition using learned facial representations
-- Face-to-face similarity comparison
-- Image, video, and webcam testing utilities
-- A graphical interface built on top of the API
-
----
-
-## 🔍 Overview
-
-ASIMOV separates **face detection** from **face recognition**.
-
-**RetinaFace** locates faces in an input image. **ArcFace** then provides the recognition component, allowing face crops to be represented and compared.
-
-The `API` class exposes three main operations:
+The `API` class in `application.core.API` exposes the core operations:
 
 | Method | Purpose |
 | --- | --- |
-| `detect_faces(frame, draw_bounding_box)` | Detect faces and optionally annotate the image |
-| `recognize_faces(image)` | Compare a face crop against known faces |
-| `compare_faces(first_crop, second_crop)` | Compare two face crops for similarity |
+| `detect_faces(frame, draw_bounding_box)` | Detect faces and optionally annotate the input image |
+| `recognize_faces(image)` | Generate an embedding for a face crop |
+| `compare_faces(first_crop, second_crop)` | Compare two face crops |
 
-Detection and recognition can be enabled through the application's configuration. Model locations are defined separately in `Settings.py`.
+Model paths and other settings are configured in `Settings.py`. The application currently uses TensorFlow for inference and PyQt5 for the desktop interface.
 
-The existing code and configuration reflect the project's original development environment. Compatibility with current Python, TensorFlow, CUDA, and operating-system versions has **not yet been revalidated**.
+## Asimov Studio
 
----
+**Asimov Studio** is the graphical workspace for experimenting with face recognition in video. It combines playback, reference management, live matching, and detailed diagnostics in one interface.
 
-## 🚀 Quickstart
+![Asimov Studio showing video recognition, grouped reference faces, recognized face crops, and diagnostics](assets/asimov_studio.jpg)
+
+### Using the studio
+
+1. **Start the application.** Run the project's `GUI.py` entry point from the configured Python environment.
+2. **Register reference faces.** Select **Reference Faces** → **Add Images**. ASIMOV detects usable faces and registers their embeddings. The initial label comes from each image's filename, without its extension.
+3. **Manage references.** Edit labels, include or exclude individual images, and select rows to assign several references to a shared identity. Reference photographs retain their own labels and match counters.
+4. **Open a video.** Select **Open Video** and choose a supported video file. Use the playback buttons or click the video itself to pause and resume. The timeline supports seeking.
+5. **Enable inference.** Turn on **Face detection** to display bounding boxes and landmarks. Enable **Face recognition** to compare detected faces with included references and display accepted identity matches.
+6. **Inspect results.** Expand **Reference Faces** to see grouped reference images and their counters. Expand **Recognized Faces** to view a rolling strip of accepted face crops and similarity scores. The oldest crops disappear as the strip fills.
+7. **Review diagnostics.** Expand **Diagnostics** to filter detection and recognition events, inspect scores, reset match counters, or export events to CSV.
+
+### Video and inference controls
+
+| Control | Behavior |
+| --- | --- |
+| **Face detection** | Enables RetinaFace detection and on-video annotations |
+| **Face recognition** | Enables comparison against included reference embeddings; also enables detection |
+| **Show FPS** | Displays the measured video display rate |
+| **No frame skipping** | Processes frames sequentially instead of skipping ahead to maintain playback timing |
+| **Inference resolution** | Runs inference at 100%, 75%, 50%, or 25% of the source frame dimensions while retaining the full-resolution video display |
+
+Recognition currently uses a similarity threshold of **0.55** and a **0.04** margin over the next-best identity when more than one identity competes. These values are experimental, not validated operating thresholds.
+
+**Current limitations:** Reference images, identity assignments, and rolling face crops are session-only; they are not persisted when the application closes. Recognition can produce false positives, particularly with challenging poses or visually similar faces. The FPS overlay measures display performance and should not be interpreted as a controlled model benchmark.
+
+## Quickstart
 
 Clone the repository:
 
@@ -48,31 +60,37 @@ git clone https://github.com/JamesPiggott/ASIMOV.git
 cd ASIMOV
 ```
 
-Create and activate a virtual environment, then install the repository's dependencies:
+Create a virtual environment and install the repository's dependencies:
 
 ```bash
 python -m venv .venv
-```
-
-On Linux or macOS:
-
-```bash
-source .venv/bin/activate
-pip install -r requirements.txt
 ```
 
 On Windows PowerShell:
 
 ```powershell
 .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-> **Compatibility note:** These commands describe the standard setup process, not a verified installation on current systems. The original project used TensorFlow 2.x and had version-specific CUDA requirements. Check dependency compatibility before attempting GPU acceleration.
+On Linux or macOS:
+
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Launch Asimov Studio from the repository's configured working directory:
+
+```bash
+python GUI.py
+```
+
+The models must be present at the locations expected by `Settings.py`. If your checkout uses Git LFS for model files, install Git LFS and run `git lfs pull` after cloning.
+
+**Environment note:** Development has been exercised on Windows 11 with Python 3.13 and TensorFlow 2.20 using CPU inference. This is not yet a tested cross-platform installation matrix; verify the repository's dependency pins and model paths for your system. Native Windows CUDA acceleration is not provided by the standard recent TensorFlow pip builds; GPU benchmarking will require a separately validated setup.
 
 ### API example
-
-The following example illustrates the original API interface:
 
 ```python
 import cv2
@@ -81,104 +99,68 @@ from application.core.API import API
 image = cv2.imread("example.jpg")
 api = API()
 
-# Detect faces and request an annotated image.
+# Detect faces and request an annotated result.
 result = api.detect_faces(image, True)
 
-# Recognition expects an individual face crop.
-# face_crop = ...
-# match = api.recognize_faces(face_crop)
+# Each detected face can provide a crop for embedding generation.
+for face in result.faces:
+    crop = face.get_crop()
+    if crop is not None and crop.size:
+        embedding = api.recognize_faces(crop)
 ```
 
-The detector returns a result containing face information, bounding boxes, and an annotated image. Recognition and comparison return match information, including a distance value and match indicator.
+## Testing and experiments
 
----
+The repository includes scripts for exercising the models outside the GUI. Depending on the checkout, these include `video_detection_test.py`, `webcam_test.py`, `image_recognition_test.py`, and `face_recognition_test.py`.
 
-## 🧪 Testing
+These utilities are useful for isolating detection, recognition, and embedding comparisons from the video interface. Automated regression coverage and repeatable benchmark runs remain areas for improvement.
 
-The original repository includes several test scripts:
+## Project status and roadmap
 
-| Script | Description |
-| --- | --- |
-| `video_detection_test.py` | RetinaFace detection on sample video |
-| `webcam_test.py` | Live detection using a webcam |
-| `image_recognition_test.py` | Face cropping, alignment, and ArcFace comparison |
-| `GUI.py` | Interactive interface built on the API |
+**Status: Active experimental development — November 2026.** The core models load and run in the current development environment, and Asimov Studio supports interactive video recognition and inspection.
 
-These scripts are useful starting points for examining the implementation. Their compatibility with a modern environment still needs to be checked.
+**Implemented**
 
----
+- RetinaFace detection and ArcFace embedding integration
+- Video playback with bounding boxes, landmarks, seeking, and FPS display
+- Reference image import, labeling, inclusion/exclusion, and match counters
+- Manual grouping of reference images into identities
+- Rolling gallery of accepted recognition crops and similarity scores
+- Filterable diagnostics with CSV export
+- Sequential/no-skip playback and selectable inference resolution
 
-## 🧭 Project Status
+**Planned / under consideration**
 
-ASIMOV is a **revived experimental project**, currently at the assessment and modernization stage.
+- **Persistent reference library:** Save reference images, embeddings, identity assignments, and settings between sessions
+- **CPU and GPU benchmarking:** Measure detection time, recognition time, end-to-end throughput, and processed/skipped frames using repeatable test inputs
+- **Recognition evaluation:** Investigate false positives, image pose, lighting, reference quality, thresholds, and identity-level decisions
+- **Identity management:** Refine grouping, editing, and reference-level comparison tools
+- **Automated tests:** Add regression tests for API behavior, GUI workflows, and inference outputs
+- **Model experimentation:** Evaluate alternative detection and recognition models against consistent test sets
 
-Original capabilities:
+Roadmap items are development directions, not implemented features or release commitments.
 
-- ✅ RetinaFace detection integration
-- ✅ ArcFace recognition integration
-- ✅ Detection, recognition, and comparison API methods
-- ✅ Example image/video/webcam testing utilities
-- ✅ Experimental GUI
+## Hardware and dependencies
 
-Planned work:
+ASIMOV uses Python, TensorFlow 2, OpenCV, NumPy, PyQt5, RetinaFace, and ArcFace models. Actual CPU/GPU performance depends on the hardware, runtime, model configuration, inference resolution, and input video.
 
-- 🔄 Audit and update Python dependencies
-- 🔄 Validate model loading and inference
-- 🔄 Revisit TensorFlow and GPU compatibility
-- 🔄 Review configuration and model-path handling
-- 🔄 Establish reproducible tests and benchmarks
+GPU support requires an appropriate operating system, drivers, TensorFlow build, and acceleration libraries. See the [official TensorFlow installation guide](https://www.tensorflow.org/install/pip) for current requirements. ASIMOV does not yet publish verified comparative CPU/GPU benchmark results.
 
-The checkmarks indicate functionality represented in the original repository, **not functionality recently verified on current platforms**.
+## Research and acknowledgements
 
----
-
-## 🎯 Goals
-
-The immediate objective is to restore a maintainable, reproducible baseline. Potential subsequent work includes:
-
-- Consistent face detection and alignment pipelines
-- Reproducible face-embedding comparisons
-- Clearer model configuration and loading
-- CPU and GPU inference benchmarking
-- Automated tests for the public API
-- Evaluation of modern detection and recognition alternatives
-- Documentation of accuracy, limitations, and operating requirements
-
-These are development directions rather than promises of implemented features.
-
----
-
-## ⚙️ Hardware and Dependencies
-
-The original implementation was developed with Python 3, TensorFlow 2, and NVIDIA CUDA acceleration in mind.
-
-GPU support depends on the combination of operating system, GPU drivers, TensorFlow version, CUDA toolkit, and cuDNN. Older installation instructions should not be assumed to work unchanged with modern releases.
-
-Refer to the [official TensorFlow installation documentation](https://www.tensorflow.org/install/pip) when rebuilding the environment. A tested dependency matrix will be added after the implementation has been validated.
-
----
-
-## 📚 Research and Acknowledgements
-
-The original implementation builds on the work of the following projects:
+The implementation builds on work from the RetinaFace and ArcFace research communities, including:
 
 - [RetinaFace for TensorFlow 2](https://github.com/peteryuX/retinaface-tf2)
 - [ArcFace for TensorFlow 2](https://github.com/peteryuX/arcface-tf2)
 
-Credit belongs to the original researchers and open-source maintainers whose work made these components possible. Model licenses, weights, and third-party dependencies should be reviewed before redistribution or deployment.
+Credit belongs to the researchers and open-source maintainers behind these components. Review the applicable model, weight, and dependency licenses before redistribution or deployment.
 
----
+## Contributing
 
-## 🤝 Contributing
+ASIMOV is a research-oriented project. Contributions relating to compatibility, reproducible testing, performance, documentation, and responsible evaluation are welcome.
 
-ASIMOV is a research-oriented project. Contributions relating to model compatibility, reproducibility, testing, documentation, performance, and responsible evaluation are welcome.
+## Disclaimer
 
----
+ASIMOV is experimental software, **not a production-ready biometric identification system**. Recognition results can be affected by pose, image quality, illumination, demographic variation, training data, and decision thresholds. A similarity score or accepted match is not definitive proof of identity.
 
-## ⚠️ Disclaimer
-
-ASIMOV is experimental software and is not presented as a production-ready biometric identification system.
-
-Face recognition results can be affected by image quality, pose, illumination, demographic variation, model training data, and decision thresholds. A similarity score or match indicator should not be treated as definitive proof of identity.
-
-Any use involving real people or biometric data must account for consent, privacy, security, and applicable legal requirements. Do not deploy this software for consequential identification or surveillance without appropriate validation and safeguards.
+Use involving real people or biometric data must account for consent, privacy, security, and applicable law. Do not use ASIMOV for consequential identification or surveillance without appropriate independent validation and safeguards.

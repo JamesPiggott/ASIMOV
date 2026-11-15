@@ -3,6 +3,7 @@ import os
 import html
 import colorsys
 import csv
+import uuid
 
 # Initialize TensorFlow before PyQt5 on Windows.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
@@ -14,12 +15,13 @@ import sys
 import time
 from pathlib import Path
 from threading import Condition, Lock
+from collections import deque
 
 import cv2
 import numpy as np
 
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtGui import QImage, QPixmap, QIcon
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -40,6 +42,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QTextEdit,
     QComboBox,
+    QInputDialog,
     QToolButton,
     QListWidget,
     QListWidgetItem,
@@ -146,30 +149,42 @@ class DetectionWorker(QThread):
                     best_name = None
                     best_score = None
                     best_reference_id = None
+                    best_reference_label = None
                     if vector is not None and np.all(np.isfinite(vector)):
                         magnitude = np.linalg.norm(vector)
                         if magnitude > 0:
                             normalized = vector / magnitude
                             candidates = []
-                            for ref_id, ref_name, ref_vector in references:
+                            for ref_id, identity_id, identity_name, reference_label, ref_vector in references:
                                 if ref_vector.shape == normalized.shape:
-                                    candidates.append((float(np.dot(normalized, ref_vector)), ref_name, ref_id))
-                            # Group reference photographs by identity; multiple images
-                            # of one person must not compete with each other.
+                                    candidates.append((float(np.dot(normalized, ref_vector)),
+                                                       identity_id, identity_name, ref_id, reference_label))
+                            # Compare each reference, but rank identities using their best image.
+                            # Ungrouped references retain independent identity IDs.
                             by_identity = {}
-                            for score, identity, reference_id in candidates:
-                                key = identity.strip().casefold()
-                                if key not in by_identity or score > by_identity[key][0]:
-                                    by_identity[key] = (score, identity, reference_id)
+                            for score, identity_id, identity_name, reference_id, reference_label in candidates:
+                                if identity_id not in by_identity or score > by_identity[identity_id][0]:
+                                    by_identity[identity_id] = (score, identity_name, reference_id, reference_label)
                             ranked = sorted(by_identity.values(), key=lambda value: value[0], reverse=True)
+                            best_reference_label = None
                             if ranked:
-                                best_score, best_name, best_reference_id = ranked[0]
+                                best_score, best_name, best_reference_id, best_reference_label = ranked[0]
                                 if best_score >= 0.55 and (len(ranked) == 1 or best_score - ranked[1][0] >= 0.04):
                                     name = best_name
 
+                    # Retain a compact crop from this exact inference frame.
+                    # Never crop from a later playback frame: inference is asynchronous.
+                    accepted_crop = None
+                    if name is not None and name != "Unknown":
+                        crop = face.get_crop()
+                        if crop is not None and crop.size:
+                            accepted_crop = cv2.resize(crop, (72, 72), interpolation=cv2.INTER_AREA)
+
                     detections.append({
+                        "accepted_crop": accepted_crop,
                         "name": name,
                         "best_name": best_name,
+                        "best_reference_label": best_reference_label,
                         "best_score": best_score,
                         "best_reference_id": best_reference_id if name == best_name else None,
                         "box": (
@@ -246,6 +261,19 @@ class ReferenceImageWorker(QThread):
         self.completed.emit(faces, errors)
 
 
+class ClickableVideoLabel(QLabel):
+    """Video surface that toggles playback on a left click."""
+
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+
 class ReferenceFacesDialog(QDialog):
     """Immediately registered faces, editable inline with native row selection."""
 
@@ -256,11 +284,13 @@ class ReferenceFacesDialog(QDialog):
         self.registry = parent.face_registry
         self.worker = None
         self.row_lookup = {}
+        self.row_widgets = {}
+        self._rendering_registry = False
         layout = QVBoxLayout(self)
         heading = QLabel("Reference faces")
         heading.setStyleSheet("font-size: 18px; font-weight: 700;")
         layout.addWidget(heading)
-        layout.addWidget(QLabel("Add photographs, edit names and choose which faces are included. Ctrl/Shift-click to select multiple rows."))
+        layout.addWidget(QLabel("Add photographs, edit reference labels, and manually assign identities. Ctrl/Shift-click to select multiple rows."))
 
         toolbar = QHBoxLayout()
         self.upload_button = QPushButton("Add Images...")
@@ -285,10 +315,14 @@ class ReferenceFacesDialog(QDialog):
         self.include_button.clicked.connect(lambda: self.bulk_include(True))
         self.exclude_button = QPushButton("Exclude Selected")
         self.exclude_button.clicked.connect(lambda: self.bulk_include(False))
+        self.assign_button = QPushButton("Assign Identity...")
+        self.assign_button.clicked.connect(self.assign_identity)
+        self.ungroup_button = QPushButton("Ungroup Selected")
+        self.ungroup_button.clicked.connect(self.ungroup_selected)
         self.remove_button = QPushButton("Delete Selected")
         self.remove_button.clicked.connect(self.remove_selected)
-        for button in (self.include_button, self.exclude_button, self.remove_button):
-            button.setVisible(False)
+        for button in (self.include_button, self.exclude_button, self.assign_button, self.ungroup_button, self.remove_button):
+            button.setEnabled(False)
             bottom.addWidget(button)
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.accept)
@@ -310,62 +344,88 @@ class ReferenceFacesDialog(QDialog):
         return preview
 
     def render_registry(self):
+        # Avoid re-entrant selection notifications while Qt destroys row widgets.
+        self._rendering_registry = True
+        self.list_widget.blockSignals(True)
         self.list_widget.clear()
         self.row_lookup.clear()
+        self.row_widgets.clear()
         for entry in self.registry:
             entry.setdefault("id", id(entry))
             entry.setdefault("included", True)
             entry.setdefault("matches", 0)
             entry.setdefault("name", "")
+            entry.setdefault("identity_id", None)
+            entry.setdefault("identity_name", None)
             item = QListWidgetItem()
-            item.setSizeHint(QSize(500, 88))
+            item.setSizeHint(QSize(500, 92))
             self.list_widget.addItem(item)
             self.row_lookup[id(item)] = entry
             row = QWidget()
+            row.setObjectName("referenceRow")
+            self.row_widgets[id(item)] = row
             line = QHBoxLayout(row)
             line.setContentsMargins(8, 3, 8, 3)
             thumbnail = self.make_preview(entry.get("crop"))
-            # Clicking the thumbnail selects its QListWidget row, including Ctrl/Shift selection.
-            thumbnail.mousePressEvent = lambda event, it=item: self.select_thumbnail(it, event)
+            # Passive thumbnail: do not install a mouse handler or nested button.
+            # Native QListWidget selection works via the row's text/blank area.
+            # Interactive children inside setItemWidget caused a Windows Qt crash.
+            thumbnail.setToolTip("Select this reference by clicking the row beside the image")
+            thumbnail.setAttribute(Qt.WA_TransparentForMouseEvents, True)
             line.addWidget(thumbnail)
             field = QLineEdit(entry["name"])
-            field.setPlaceholderText("Enter name (same name groups reference images)")
+            field.setPlaceholderText("Reference image label")
             field.editingFinished.connect(lambda e=entry, f=field: self.rename(e, f))
             line.addWidget(field, 1)
+            identity_label = QLabel(entry.get("identity_name") or "Independent")
+            identity_label.setToolTip("Assigned identity (or independent reference)")
+            identity_label.setMinimumWidth(95)
+            line.addWidget(identity_label)
             included = QCheckBox("Include")
             included.setChecked(entry["included"])
             included.toggled.connect(lambda value, e=entry: self.set_included(e, value))
             line.addWidget(included)
             self.list_widget.setItemWidget(item, row)
+        self.list_widget.blockSignals(False)
+        self._rendering_registry = False
         self.update_selection_actions()
         self.refresh_count()
 
-    def select_thumbnail(self, item, event):
-        flags = event.modifiers()
-        if flags & Qt.ControlModifier:
-            item.setSelected(not item.isSelected())
-        elif flags & Qt.ShiftModifier and self.list_widget.currentRow() >= 0:
-            start = self.list_widget.currentRow()
-            end = self.list_widget.row(item)
-            for index in range(min(start, end), max(start, end) + 1):
-                self.list_widget.item(index).setSelected(True)
-        else:
-            self.list_widget.clearSelection()
-            item.setSelected(True)
-        self.list_widget.setCurrentItem(item, QAbstractItemView.NoUpdate)
-
     def selected_entries(self):
-        return [self.row_lookup[id(item)] for item in self.list_widget.selectedItems()]
+        return [self.row_lookup[id(item)] for item in self.list_widget.selectedItems()
+                if id(item) in self.row_lookup]
 
     def update_selection_actions(self):
+        if self._rendering_registry:
+            return
         has_selection = bool(self.list_widget.selectedItems())
-        for button in (self.include_button, self.exclude_button, self.remove_button):
-            button.setVisible(has_selection)
-        self.refresh_count()
+        # Keep toolbar geometry stable; toggling visibility from a Qt selection
+        # callback can trigger nested layout/selection events on Windows.
+        for button in (self.include_button, self.exclude_button, self.assign_button, self.ungroup_button, self.remove_button):
+            button.setEnabled(has_selection)
+        self.count_label.setText(self._count_text())
+        # QListWidget's default selection highlight is obscured by setItemWidget.
+        # Paint the embedded row widget directly, without rebuilding the list.
+        selected_ids = {id(item) for item in self.list_widget.selectedItems()}
+        for item_id, row in self.row_widgets.items():
+            if item_id in selected_ids:
+                row.setStyleSheet(
+                    "QWidget#referenceRow { background-color: #28534e; "
+                    "border: 1px solid #65d8c1; border-radius: 5px; }"
+                )
+            else:
+                row.setStyleSheet(
+                    "QWidget#referenceRow { background-color: #202832; "
+                    "border: 1px solid transparent; border-radius: 5px; }"
+                )
+
+    def _count_text(self):
+        included = sum(e.get("included", True) for e in self.registry)
+        identities = {e.get("identity_id") or e.get("id") for e in self.registry}
+        return f"{len(self.registry)} images · {len(identities)} identities · {included} included · {len(self.selected_entries())} selected"
 
     def refresh_count(self):
-        included = sum(e.get("included", True) for e in self.registry)
-        self.count_label.setText(f"{len(self.registry)} images · {included} included · {len(self.selected_entries())} selected")
+        self.count_label.setText(self._count_text())
         self.parent().refresh_reference_strip()
 
     def set_included(self, entry, value):
@@ -375,6 +435,40 @@ class ReferenceFacesDialog(QDialog):
     def rename(self, entry, field):
         entry["name"] = field.text().strip()
         self.refresh_count()
+
+    def assign_identity(self):
+        selected = self.selected_entries()
+        if not selected:
+            return
+        existing = sorted({e.get("identity_name") for e in self.registry if e.get("identity_name")}, key=str.casefold)
+        choices = ["Create new identity..."] + existing
+        choice, ok = QInputDialog.getItem(self, "Assign Identity", "Identity:", choices, 0, False)
+        if not ok:
+            return
+        if choice == choices[0]:
+            name, ok = QInputDialog.getText(self, "New Identity", "Identity name:")
+            if not ok or not name.strip():
+                return
+            name = name.strip()
+        else:
+            name = choice
+        # Reuse existing IDs when adding images to an identity.
+        existing_entry = next((e for e in self.registry if (e.get("identity_name") or "").casefold() == name.casefold()), None)
+        identity_id = existing_entry["identity_id"] if existing_entry else str(uuid.uuid4())
+        canonical_name = existing_entry["identity_name"] if existing_entry else name
+        for entry in selected:
+            entry["identity_id"] = identity_id
+            entry["identity_name"] = canonical_name
+        self.render_registry()
+        self.message.setText(f"Assigned {len(selected)} reference(s) to {canonical_name}.")
+
+    def ungroup_selected(self):
+        selected = self.selected_entries()
+        for entry in selected:
+            entry["identity_id"] = None
+            entry["identity_name"] = None
+        self.render_registry()
+        self.message.setText(f"Made {len(selected)} reference(s) independent.")
 
     def bulk_include(self, value):
         for entry in self.selected_entries():
@@ -464,6 +558,7 @@ class BasicVideoApp(QMainWindow):
         self.diagnostic_events = []
         self.diagnostic_limit = 10000
         self.diagnostic_dirty = False
+        self.recent_recognitions = deque(maxlen=100)
 
         # Build Qt UI before starting the worker.
         self.build_interface()
@@ -540,8 +635,9 @@ class BasicVideoApp(QMainWindow):
         video_layout = QVBoxLayout(video_container)
         video_layout.setContentsMargins(12, 12, 12, 12)
 
-        self.video_label = QLabel()
+        self.video_label = ClickableVideoLabel()
         self.video_label.setObjectName("videoDisplay")
+        self.video_label.clicked.connect(self.toggle_video_playback)
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setMinimumSize(320, 180)
         self.video_label.setSizePolicy(
@@ -655,12 +751,20 @@ class BasicVideoApp(QMainWindow):
 
         root.addWidget(toolbar)
 
-        # Collapsible reference strip: default closed to maximize video height.
+        # Two independent collapsible strips share a single row.
+        # Both are closed initially to prioritize the video preview.
+        strips = QHBoxLayout()
+        strips.setSpacing(12)
+
+        reference_panel = QWidget()
+        reference_panel_layout = QVBoxLayout(reference_panel)
+        reference_panel_layout.setContentsMargins(0, 0, 0, 0)
+        reference_panel_layout.setSpacing(4)
         self.reference_toggle = QToolButton()
         self.reference_toggle.setCheckable(True)
         self.reference_toggle.setText("Reference Faces  ▸")
         self.reference_toggle.toggled.connect(self.toggle_reference_strip)
-        root.addWidget(self.reference_toggle)
+        reference_panel_layout.addWidget(self.reference_toggle)
         self.reference_count_label = QLabel("0 images")
         self.reference_scroll = QScrollArea()
         self.reference_scroll.setWidgetResizable(True)
@@ -673,7 +777,32 @@ class BasicVideoApp(QMainWindow):
         self.reference_strip_layout.addStretch()
         self.reference_scroll.setWidget(self.reference_strip_widget)
         self.reference_scroll.setVisible(False)
-        root.addWidget(self.reference_scroll)
+        reference_panel_layout.addWidget(self.reference_scroll)
+        strips.addWidget(reference_panel, 1)
+
+        recognized_panel = QWidget()
+        recognized_panel_layout = QVBoxLayout(recognized_panel)
+        recognized_panel_layout.setContentsMargins(0, 0, 0, 0)
+        recognized_panel_layout.setSpacing(4)
+        self.recognized_toggle = QToolButton()
+        self.recognized_toggle.setCheckable(True)
+        self.recognized_toggle.setText("Recognized Faces  ▸")
+        self.recognized_toggle.toggled.connect(self.toggle_recognized_strip)
+        recognized_panel_layout.addWidget(self.recognized_toggle)
+        self.recognized_scroll = QScrollArea()
+        self.recognized_scroll.setWidgetResizable(True)
+        self.recognized_scroll.setFixedHeight(94)
+        self.recognized_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.recognized_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.recognized_strip_widget = QWidget()
+        self.recognized_strip_layout = QHBoxLayout(self.recognized_strip_widget)
+        self.recognized_strip_layout.setContentsMargins(6, 2, 6, 2)
+        self.recognized_strip_layout.setSpacing(6)
+        self.recognized_scroll.setWidget(self.recognized_strip_widget)
+        self.recognized_scroll.setVisible(False)
+        recognized_panel_layout.addWidget(self.recognized_scroll)
+        strips.addWidget(recognized_panel, 1)
+        root.addLayout(strips)
 
         # Expandable, filterable diagnostics. Events are bounded in memory.
         self.diagnostic_toggle = QToolButton()
@@ -742,50 +871,130 @@ class BasicVideoApp(QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
         registry = self.face_registry
-        names = {x.get("name", "").strip().casefold() for x in registry if x.get("name", "").strip()}
-        self.reference_count_label.setText(f"{len(registry)} image(s) · {len(names)} named person(s)")
+        groups = {}
+        for entry in registry:
+            key = ("identity", entry["identity_id"]) if entry.get("identity_id") else ("independent", entry.get("id"))
+            groups.setdefault(key, []).append(entry)
+        self.reference_count_label.setText(f"{len(registry)} image(s) · {len(groups)} identities")
         self.reference_toggle.setText(
-            f"Reference Faces ({len(registry)} images · {len(names)} people)  "
+            f"Reference Faces ({len(registry)} images · {len(groups)} identities)  "
             + ("▾" if self.reference_toggle.isChecked() else "▸")
         )
-        for entry in registry:
-            cell = QWidget()
-            column = QVBoxLayout(cell)
-            column.setContentsMargins(3, 0, 3, 0)
-            crop = entry.get("crop")
-            preview = ReferenceFacesDialog.make_preview(crop)
-            preview.setFixedSize(65, 65)
-            if preview.pixmap() is not None:
-                preview.setPixmap(preview.pixmap().scaled(62, 62, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            # Overlay the accepted-match count on the image itself.
-            # The badge is a child of the thumbnail, not a layout item,
-            # so it cannot push the name or counter out of view.
-            count = QLabel(str(entry.get("matches", 0)), preview)
-            count.setAlignment(Qt.AlignCenter)
-            count.setToolTip("Accepted recognition matches for this reference image")
-            count.setStyleSheet(
-                "QLabel { background-color: rgba(12, 19, 26, 220); "
-                f"color: {self.color_for_identity(entry.get('name', ''))}; "
-                "border: 1px solid rgba(255,255,255,65); "
-                "border-radius: 9px; font-size: 11px; font-weight: 700; "
-                "padding: 0px 4px; }"
+        for key, entries in groups.items():
+            grouped = key[0] == "identity"
+            name = entries[0].get("identity_name") if grouped else "Independent"
+            container = QFrame()
+            container.setObjectName("identityGroup" if grouped else "independentGroup")
+            container.setStyleSheet(
+                "QFrame#identityGroup { background: #202d37; border: 1px solid #4c8f88; border-radius: 5px; }"
+                "QFrame#independentGroup { background: #1b242c; border: 1px solid #35434f; border-radius: 5px; }"
             )
-            count.adjustSize()
-            count.resize(max(20, count.width()), 19)
-            count.move(preview.width() - count.width() - 2, preview.height() - 21)
-            count.show()
-            column.addWidget(preview)
-            label = QLabel(entry.get("name") or "Unlabelled")
-            label.setMaximumWidth(100)
-            label.setToolTip(entry.get("name") or "Unlabelled")
-            label.setStyleSheet("color: #8496a5;" if not entry.get("included", True) else "")
-            column.addWidget(label)
-            layout.addWidget(cell)
+            vertical = QVBoxLayout(container)
+            vertical.setContentsMargins(5, 3, 5, 3)
+            vertical.setSpacing(2)
+            header = QLabel(name or "Independent")
+            header.setStyleSheet("font-size: 10px; font-weight: 600; color: #65d8c1; border: none;")
+            header.setToolTip(name or "Independent reference")
+            vertical.addWidget(header)
+            images = QHBoxLayout()
+            images.setSpacing(4)
+            for entry in entries:
+                cell = QWidget()
+                column = QVBoxLayout(cell)
+                column.setContentsMargins(0, 0, 0, 0)
+                column.setSpacing(1)
+                preview = ReferenceFacesDialog.make_preview(entry.get("crop"))
+                preview.setFixedSize(52, 52)
+                if preview.pixmap() is not None:
+                    preview.setPixmap(preview.pixmap().scaled(50, 50, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                count = QLabel(str(entry.get("matches", 0)), preview)
+                count.setAlignment(Qt.AlignCenter)
+                count.setToolTip("Accepted matches for this reference")
+                count.setStyleSheet(
+                    "QLabel { background-color: rgba(12, 19, 26, 220); "
+                    f"color: {self.color_for_identity(entry.get('identity_name') or entry.get('name', ''))}; "
+                    "border: 1px solid rgba(255,255,255,65); border-radius: 8px; "
+                    "font-size: 10px; font-weight: 700; padding: 0px 3px; }"
+                )
+                count.adjustSize()
+                count.resize(max(17, count.width()), 16)
+                count.move(preview.width() - count.width() - 1, preview.height() - 17)
+                count.show()
+                column.addWidget(preview)
+                label = QLabel(entry.get("name") or "Unlabelled")
+                label.setMaximumWidth(58)
+                label.setToolTip(entry.get("name") or "Unlabelled")
+                label.setStyleSheet("font-size: 9px; color: #8496a5;" if not entry.get("included", True) else "font-size: 9px;")
+                column.addWidget(label)
+                images.addWidget(cell)
+            vertical.addLayout(images)
+            layout.addWidget(container)
         layout.addStretch()
 
     def toggle_reference_strip(self, expanded):
         self.reference_scroll.setVisible(expanded)
         self.refresh_reference_strip()
+
+    def toggle_recognized_strip(self, expanded):
+        self.recognized_scroll.setVisible(expanded)
+        self.refresh_recognized_strip()
+
+    def recognized_capacity(self):
+        # Each cell uses 71 px including spacing; avoid horizontal scrolling.
+        width = self.recognized_scroll.viewport().width()
+        return max(1, (max(0, width - 12) + 6) // 77)
+
+    def refresh_recognized_strip(self):
+        if not hasattr(self, "recognized_strip_layout"):
+            return
+        arrow = "▾" if self.recognized_toggle.isChecked() else "▸"
+        self.recognized_toggle.setText(
+            f"Recognized Faces ({len(self.recent_recognitions)} recent)  {arrow}")
+        layout = self.recognized_strip_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for event in list(self.recent_recognitions)[-self.recognized_capacity():]:
+            cell = QWidget()
+            column = QVBoxLayout(cell)
+            column.setContentsMargins(2, 0, 2, 0)
+            column.setSpacing(1)
+            preview = ReferenceFacesDialog.make_preview(event["crop"])
+            preview.setFixedSize(65, 65)
+            if preview.pixmap() is not None:
+                preview.setPixmap(preview.pixmap().scaled(
+                    62, 62, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            preview.setToolTip(
+                f'{event["name"]} · similarity {event["score"]:.3f} · '
+                f'{self.format_time(event["seconds"])}')
+            column.addWidget(preview)
+            label = QLabel(f'{event["score"]:.3f}')
+            label.setAlignment(Qt.AlignCenter)
+            label.setFixedWidth(65)
+            label.setStyleSheet(f'color: {self.color_for_identity(event["name"])};')
+            label.setToolTip(event["name"])
+            column.addWidget(label)
+            layout.addWidget(cell)
+        layout.addStretch()
+
+    def add_recognized_crop(self, detection, frame_number):
+        crop = detection.get("accepted_crop")
+        score = detection.get("best_score")
+        if crop is None or score is None:
+            return
+        self.recent_recognitions.append({
+            "crop": crop,
+            "score": float(score),
+            "name": detection["name"],
+            "seconds": frame_number / self.video_fps if self.video_fps else 0,
+        })
+        self.refresh_recognized_strip()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "recognized_scroll") and hasattr(self, "recent_recognitions"):
+            self.refresh_recognized_strip()
 
     def toggle_diagnostics(self, expanded):
         self.diagnostic_panel.setVisible(expanded)
@@ -1275,6 +1484,14 @@ class BasicVideoApp(QMainWindow):
 
         self.update_controls()
 
+    def toggle_video_playback(self):
+        if not self.video_path:
+            return
+        if self.is_paused:
+            self.play_video()
+        else:
+            self.pause_video()
+
     def pause_video(self):
         if self.video_capture is None or self.is_paused:
             return
@@ -1430,16 +1647,18 @@ class BasicVideoApp(QMainWindow):
                 accepted = bool(detection.get("name") and detection["name"] != "Unknown")
                 identity = detection.get("name") if accepted else detection.get("best_name")
                 reference_id = detection.get("best_reference_id")
+                if accepted:
+                    self.add_recognized_crop(detection, frame_number)
                 if accepted and reference_id is not None:
                     for entry in self.face_registry:
                         if entry.get("id") == reference_id:
                             entry["matches"] = entry.get("matches", 0) + 1
                             counts_changed = True
                             break
-                self.add_diagnostic("Recognition", f"{detection.get('name') or 'Unknown'} · best: {detection.get('best_name') or 'N/A'} · similarity {score_text} · threshold 0.55", frame_number, identity=identity, accepted=accepted,
+                self.add_diagnostic("Recognition", f"{detection.get('name') or 'Unknown'} · best reference: {detection.get('best_reference_label') or 'N/A'} · similarity {score_text} · threshold 0.55", frame_number, identity=identity, accepted=accepted,
                                     metadata={"face_width": max(0,x2-x1), "face_height": max(0,y2-y1),
                                               "detection_confidence": detection["probability"],
-                                              "best_reference": detection.get("best_name") or "",
+                                              "best_reference": detection.get("best_reference_label") or "",
                                               "best_reference_id": reference_id or "",
                                               "similarity": score if score is not None else "",
                                               "threshold": 0.55})
@@ -1629,12 +1848,14 @@ class BasicVideoApp(QMainWindow):
             references = []
             if self.recognition_checkbox.isChecked():
                 for item in self.face_registry:
-                    if not item.get("included", True) or not item.get("name", "").strip():
+                    if not item.get("included", True) or not (item.get("identity_name") or item.get("name", "")).strip():
                         continue
                     vector = np.asarray(item["embedding"], dtype=np.float32).reshape(-1)
                     magnitude = np.linalg.norm(vector)
                     if magnitude > 0 and np.isfinite(magnitude):
-                        references.append((item["id"], item["name"], (vector / magnitude).copy()))
+                        references.append((item["id"], item.get("identity_id") or str(item["id"]),
+                                           item.get("identity_name") or item["name"],
+                                           item["name"], (vector / magnitude).copy()))
             scale = float(self.inference_scale_combo.currentData())
             if scale != 1.0:
                 inference_frame = cv2.resize(
