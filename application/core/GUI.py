@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
-from PyQt5.QtGui import QImage, QPixmap, QIcon
+from PyQt5.QtGui import QImage, QPixmap, QIcon, QPainter, QColor, QPen, QFont
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -37,6 +37,7 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QSizePolicy,
     QDialog,
+    QGridLayout,
     QScrollArea,
     QLineEdit,
     QMessageBox,
@@ -44,9 +45,11 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QInputDialog,
     QToolButton,
+    QMenu,
     QListWidget,
     QListWidgetItem,
     QAbstractItemView,
+    QSplitter,
 )
 
 
@@ -70,7 +73,7 @@ class DetectionWorker(QThread):
         self.pending = None
         self.running = True
 
-    def submit(self, frame, frame_number, generation, references=(), original_size=None):
+    def submit(self, frame, frame_number, generation, references=(), original_size=None, crop_padding=0.0, crop_mode="legacy"):
         with self.condition:
             if not self.running:
                 return
@@ -81,6 +84,8 @@ class DetectionWorker(QThread):
                 generation,
                 references,
                 original_size,
+                crop_padding,
+                crop_mode,
             )
 
             self.condition.notify()
@@ -104,29 +109,46 @@ class DetectionWorker(QThread):
                 if not self.running:
                     return
 
-                frame, frame_number, generation, references, original_size = self.pending
+                frame, frame_number, generation, references, original_size, crop_padding, crop_mode = self.pending
                 self.pending = None
 
             try:
+                worker_started = time.perf_counter()
+                detection_ms = 0.0
+                embedding_ms = 0.0
+                crop_ms = 0.0
+                arcface_ms = 0.0
+                embedding_count = 0
                 with self.api_lock:
+                    detection_started = time.perf_counter()
                     result = self.api.detect_faces(frame, False)
+                    detection_ms = (time.perf_counter() - detection_started) * 1000.0
                     # Embeddings are calculated from the same detected face objects.
                     # This runs off the GUI thread and shares the API lock with imports.
                     face_results = []
                     for face in result.faces:
                         vector = None
+                        recognition_crop = None
                         if references:
-                            crop = face.get_crop()
+                            embedding_started = time.perf_counter()
+                            crop_started = time.perf_counter()
+                            crop = self.api.crop_face(frame, face, crop_padding, mode=crop_mode)
+                            crop_ms += (time.perf_counter() - crop_started) * 1000.0
                             if crop is not None and crop.size:
+                                arcface_started = time.perf_counter()
+                                recognition_crop = crop
                                 raw = self.api.recognize_faces(crop)
+                                arcface_ms += (time.perf_counter() - arcface_started) * 1000.0
                                 if hasattr(raw, "numpy"):
                                     raw = raw.numpy()
                                 vector = np.asarray(raw, dtype=np.float32).reshape(-1)
-                        face_results.append((face, vector))
+                                embedding_count += 1
+                            embedding_ms += (time.perf_counter() - embedding_started) * 1000.0
+                        face_results.append((face, vector, recognition_crop))
 
                 detections = []
 
-                for face, vector in face_results:
+                for face, vector, recognition_crop in face_results:
                     box = face.bound_box
 
                     landmarks = []
@@ -150,6 +172,10 @@ class DetectionWorker(QThread):
                     best_score = None
                     best_reference_id = None
                     best_reference_label = None
+                    runner_up_name = None
+                    runner_up_score = None
+                    score_margin = None
+                    best_candidate_reference_id = None
                     if vector is not None and np.all(np.isfinite(vector)):
                         magnitude = np.linalg.norm(vector)
                         if magnitude > 0:
@@ -169,6 +195,10 @@ class DetectionWorker(QThread):
                             best_reference_label = None
                             if ranked:
                                 best_score, best_name, best_reference_id, best_reference_label = ranked[0]
+                                best_candidate_reference_id = best_reference_id
+                                if len(ranked) > 1:
+                                    runner_up_score, runner_up_name = ranked[1][0], ranked[1][1]
+                                    score_margin = best_score - runner_up_score
                                 if best_score >= 0.55 and (len(ranked) == 1 or best_score - ranked[1][0] >= 0.04):
                                     name = best_name
 
@@ -176,15 +206,18 @@ class DetectionWorker(QThread):
                     # Never crop from a later playback frame: inference is asynchronous.
                     accepted_crop = None
                     if name is not None and name != "Unknown":
-                        crop = face.get_crop()
-                        if crop is not None and crop.size:
-                            accepted_crop = cv2.resize(crop, (72, 72), interpolation=cv2.INTER_AREA)
+                        if recognition_crop is not None and recognition_crop.size:
+                            accepted_crop = cv2.resize(recognition_crop, (72, 72), interpolation=cv2.INTER_AREA)
 
                     detections.append({
                         "accepted_crop": accepted_crop,
                         "name": name,
                         "best_name": best_name,
                         "best_reference_label": best_reference_label,
+                        "best_candidate_reference_id": best_candidate_reference_id,
+                        "runner_up_name": runner_up_name,
+                        "runner_up_score": runner_up_score,
+                        "score_margin": score_margin,
                         "best_score": best_score,
                         "best_reference_id": best_reference_id if name == best_name else None,
                         "box": (
@@ -210,6 +243,18 @@ class DetectionWorker(QThread):
                             (int(round(x * sx)), int(round(y * sy)))
                             for x, y in item["landmarks"]
                         ]
+                # A separate frame-level event avoids repeating timing data for each face.
+                detections.append({"_performance": {
+                    "detection_ms": round(detection_ms, 2),
+                    "embedding_ms": round(embedding_ms, 2),
+                    "crop_ms": round(crop_ms, 2),
+                    "arcface_ms": round(arcface_ms, 2),
+                    "worker_total_ms": round((time.perf_counter() - worker_started) * 1000.0, 2),
+                    "embedding_count": embedding_count,
+                    "processed_face_count": len(face_results),
+                    "inference_width": frame.shape[1],
+                    "inference_height": frame.shape[0],
+                }})
                 self.detection_ready.emit(
                     detections,
                     frame_number,
@@ -220,16 +265,20 @@ class DetectionWorker(QThread):
                 self.detection_error.emit(str(exc))
 
 
+
+
 class ReferenceImageWorker(QThread):
     """Import multiple images in one background job, isolating model calls."""
 
     completed = pyqtSignal(object, object)
 
-    def __init__(self, api, api_lock, paths):
+    def __init__(self, api, api_lock, paths, crop_padding=0.0, crop_mode="legacy"):
         super().__init__()
         self.api = api
         self.api_lock = api_lock
         self.paths = list(paths)
+        self.crop_padding = crop_padding
+        self.crop_mode = crop_mode
 
     def run(self):
         faces, errors = [], []
@@ -240,10 +289,10 @@ class ReferenceImageWorker(QThread):
                 if image is None:
                     raise ValueError("Cannot read image")
                 with self.api_lock:
-                    result = self.api.detect_faces(image, True)
+                    result = self.api.detect_faces(image, False)
                     count = 0
                     for face in result.faces:
-                        crop = face.get_crop()
+                        crop = self.api.crop_face(image, face, self.crop_padding, mode=self.crop_mode)
                         if crop is None or crop.size == 0:
                             continue
                         embedding = self.api.recognize_faces(crop)
@@ -252,7 +301,7 @@ class ReferenceImageWorker(QThread):
                         embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
                         if embedding.size == 0 or not np.all(np.isfinite(embedding)):
                             continue
-                        faces.append((path, crop.copy(), embedding.copy()))
+                        faces.append((path, crop.copy(), embedding.copy(), self.api.assess_face_quality(image, face, crop), face))
                         count += 1
                 if not count:
                     errors.append(f"{Path(path).name}: no usable faces")
@@ -260,6 +309,44 @@ class ReferenceImageWorker(QThread):
                 errors.append(f"{Path(path).name}: {exc}")
         self.completed.emit(faces, errors)
 
+
+
+class ReferenceRecropWorker(QThread):
+    """Rebuild reference embeddings from original photographs without redetection."""
+    completed = pyqtSignal(object, object)
+
+    def __init__(self, api, api_lock, entries, padding, mode="legacy"):
+        super().__init__()
+        self.api, self.api_lock = api, api_lock
+        self.entries = [(e["id"], e["source"], e["detected_face"]) for e in entries]
+        self.padding = padding
+        self.mode = mode
+
+    def run(self):
+        updates, errors = {}, []
+        image_cache = {}
+        for ref_id, path, face in self.entries:
+            try:
+                if path not in image_cache:
+                    raw = np.fromfile(path, dtype=np.uint8)
+                    image_cache[path] = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+                image = image_cache[path]
+                if image is None:
+                    raise ValueError("Source image cannot be read")
+                crop = self.api.crop_face(image, face, self.padding, mode=self.mode)
+                if crop.size == 0:
+                    raise ValueError("Empty crop at this padding")
+                with self.api_lock:
+                    raw_vector = self.api.recognize_faces(crop)
+                if hasattr(raw_vector, "numpy"):
+                    raw_vector = raw_vector.numpy()
+                vector = np.asarray(raw_vector, dtype=np.float32).reshape(-1)
+                if vector.size == 0 or not np.all(np.isfinite(vector)):
+                    raise ValueError("Invalid embedding")
+                updates[ref_id] = (crop, vector)
+            except Exception as exc:
+                errors.append(f"{Path(path).name}: {exc}")
+        self.completed.emit(updates, errors)
 
 class ClickableVideoLabel(QLabel):
     """Video surface that toggles playback on a left click."""
@@ -280,7 +367,7 @@ class ReferenceFacesDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle("ASIMOV | Reference Faces")
-        self.resize(780, 580)
+        self.resize(1120, 630)
         self.registry = parent.face_registry
         self.worker = None
         self.row_lookup = {}
@@ -290,40 +377,69 @@ class ReferenceFacesDialog(QDialog):
         heading = QLabel("Reference faces")
         heading.setStyleSheet("font-size: 18px; font-weight: 700;")
         layout.addWidget(heading)
-        layout.addWidget(QLabel("Add photographs, edit reference labels, and manually assign identities. Ctrl/Shift-click to select multiple rows."))
+        layout.addWidget(QLabel("Select a reference to inspect its quality. Ctrl/Shift-click to select multiple rows."))
 
         toolbar = QHBoxLayout()
-        self.upload_button = QPushButton("Add Images...")
+        self.upload_button = QPushButton("+ Add images")
         self.upload_button.clicked.connect(self.choose_images)
         toolbar.addWidget(self.upload_button)
+        self.group_button = QPushButton("Identity ▾")
+        self.group_menu = QMenu(self)
+        self.group_menu.addAction("Assign identity…", self.assign_identity)
+        self.group_menu.addAction("Ungroup", self.ungroup_selected)
+        self.group_button.setMenu(self.group_menu)
+        toolbar.addWidget(self.group_button)
+        self.include_button = QPushButton("Include")
+        self.include_button.clicked.connect(lambda: self.bulk_include(True))
+        self.exclude_button = QPushButton("Exclude")
+        self.exclude_button.clicked.connect(lambda: self.bulk_include(False))
+        toolbar.addWidget(self.include_button)
+        toolbar.addWidget(self.exclude_button)
+        self.remove_button = QPushButton("Delete")
+        self.remove_button.clicked.connect(self.remove_selected)
+        toolbar.addWidget(self.remove_button)
         toolbar.addStretch()
         layout.addLayout(toolbar)
         self.message = QLabel("Reference faces are stored for this session only.")
         layout.addWidget(self.message)
 
+        content = QHBoxLayout()
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.list_widget.setSpacing(3)
         self.list_widget.itemSelectionChanged.connect(self.update_selection_actions)
-        layout.addWidget(self.list_widget, 1)
+        content.addWidget(self.list_widget, 3)
+
+        inspector = QFrame()
+        inspector.setObjectName("faceInspector")
+        inspector.setStyleSheet("QFrame#faceInspector {background:#1c2530; border:1px solid #35434f; border-radius:7px;}")
+        details = QVBoxLayout(inspector)
+        details.setContentsMargins(16, 14, 16, 14)
+        details.addWidget(QLabel("FACE INSPECTOR"))
+        self.inspector_preview = self.make_preview(None)
+        self.inspector_preview.setFixedSize(150, 150)
+        details.addWidget(self.inspector_preview, alignment=Qt.AlignHCenter)
+        self.inspector_name = QLabel("Select a reference image")
+        self.inspector_name.setWordWrap(True)
+        details.addWidget(self.inspector_name)
+        self.inspector_metrics = QTextEdit()
+        self.inspector_metrics.setReadOnly(True)
+        self.inspector_metrics.setFrameShape(QFrame.NoFrame)
+        self.inspector_metrics.setStyleSheet("QTextEdit {background:transparent; border:none;}")
+        self.inspector_metrics.setPlaceholderText("Select a reference to inspect its metrics.")
+        details.addWidget(self.inspector_metrics, 1)
+        self.copy_report_button = QPushButton("Copy Report")
+        self.copy_report_button.clicked.connect(self.copy_inspector_report)
+        self.copy_report_button.setEnabled(False)
+        details.addWidget(self.copy_report_button)
+        details.addStretch()
+        content.addWidget(inspector, 2)
+        layout.addLayout(content, 1)
 
         bottom = QHBoxLayout()
         self.count_label = QLabel()
         bottom.addWidget(self.count_label)
         bottom.addStretch()
-        self.include_button = QPushButton("Include Selected")
-        self.include_button.clicked.connect(lambda: self.bulk_include(True))
-        self.exclude_button = QPushButton("Exclude Selected")
-        self.exclude_button.clicked.connect(lambda: self.bulk_include(False))
-        self.assign_button = QPushButton("Assign Identity...")
-        self.assign_button.clicked.connect(self.assign_identity)
-        self.ungroup_button = QPushButton("Ungroup Selected")
-        self.ungroup_button.clicked.connect(self.ungroup_selected)
-        self.remove_button = QPushButton("Delete Selected")
-        self.remove_button.clicked.connect(self.remove_selected)
-        for button in (self.include_button, self.exclude_button, self.assign_button, self.ungroup_button, self.remove_button):
-            button.setEnabled(False)
-            bottom.addWidget(button)
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.accept)
         bottom.addWidget(close_button)
@@ -401,9 +517,10 @@ class ReferenceFacesDialog(QDialog):
         has_selection = bool(self.list_widget.selectedItems())
         # Keep toolbar geometry stable; toggling visibility from a Qt selection
         # callback can trigger nested layout/selection events on Windows.
-        for button in (self.include_button, self.exclude_button, self.assign_button, self.ungroup_button, self.remove_button):
+        for button in (self.include_button, self.exclude_button, self.group_button, self.remove_button):
             button.setEnabled(has_selection)
         self.count_label.setText(self._count_text())
+        self.update_inspector()
         # QListWidget's default selection highlight is obscured by setItemWidget.
         # Paint the embedded row widget directly, without rebuilding the list.
         selected_ids = {id(item) for item in self.list_widget.selectedItems()}
@@ -418,6 +535,90 @@ class ReferenceFacesDialog(QDialog):
                     "QWidget#referenceRow { background-color: #202832; "
                     "border: 1px solid transparent; border-radius: 5px; }"
                 )
+
+    def update_inspector(self):
+        selected = self.selected_entries()
+        if len(selected) != 1:
+            self.inspector_preview.clear()
+            self.inspector_name.setText("Select one reference" if not selected else f"{len(selected)} references selected")
+            self.inspector_metrics.setPlainText("Select a single row to inspect its metrics.")
+            self.copy_report_button.setEnabled(False)
+            return
+        entry = selected[0]
+        self.inspector_name.setText(entry.get("name") or "Unlabelled")
+        crop = entry.get("crop")
+        if crop is not None and crop.size:
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            qimg = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format_RGB888).copy()
+            self.inspector_preview.setPixmap(QPixmap.fromImage(qimg).scaled(
+                148, 148, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        metrics = entry.get("quality") or {}
+        if not metrics:
+            self.inspector_metrics.setPlainText("Quality metrics unavailable for this reference. Re-import to calculate them.")
+            self.copy_report_button.setEnabled(True)
+            return
+        def fmt(key, suffix=""):
+            value = metrics.get(key)
+            return "N/A" if value is None else f"{value}{suffix}"
+        size = metrics.get("face_size", (0, 0))
+        rows = [
+            ("Detection confidence", fmt("confidence")),
+            ("Face size", f"{size[0]} × {size[1]} px"),
+            ("Image coverage", fmt("face_coverage", "%")),
+            ("Face-region sharpness (160px)", fmt("sharpness")),
+            ("Face brightness (0–255)", fmt("brightness")),
+            ("Facial contrast (std. dev.)", fmt("contrast")),
+            ("Dark pixels (≤35)", fmt("dark_fraction", "%")),
+            ("Bright pixels (≥220)", fmt("bright_fraction", "%")),
+            ("Eye distance", fmt("eye_distance", " px")),
+            ("Eye-line roll", fmt("eye_tilt", "°")),
+            ("Nose offset / eye distance", fmt("nose_offset")),
+            ("Yaw asymmetry indicator", fmt("yaw_asymmetry")),
+            ("Pitch geometry indicator", fmt("pitch_indicator")),
+            ("Mouth tilt", fmt("mouth_tilt", "°")),
+        ]
+        body = "".join(f"<p style='margin:4px 0'><span style='color:#98aab7'>{html.escape(label)}:</span> "
+                       f"<b>{html.escape(value)}</b></p>" for label, value in rows)
+        assessment = html.escape(str(metrics.get("assessment", "Not assessed")))
+        assessment_color = {"Good": "#65d8c1", "Review": "#e9bc76", "Poor": "#e88989"}.get(assessment, "#98aab7")
+        body = f"<p style='font-size:14px;color:{assessment_color}'><b>Suitability: {assessment}</b></p>" + body
+        warnings = metrics.get("warnings", [])
+        if warnings:
+            body += "<p style='color:#e9bc76'><b>Review:</b> " + html.escape("; ".join(warnings)) + "</p>"
+        else:
+            body += "<p style='color:#65d8c1'>No heuristic warnings</p>"
+        body += "<p style='color:#8496a5;font-size:11px'>Pose and quality indicators are heuristic, not validated recognition-accuracy scores.</p>"
+        stats = entry.get("recognition_stats") or {}
+        candidate_count = stats.get("candidate_count", 0)
+        accepted_count = stats.get("accepted_count", 0)
+        scores = stats.get("accepted_scores", [])
+        margins = stats.get("accepted_margins", [])
+        body += "<hr><b>REFERENCE PERFORMANCE</b>"
+        body += f"<p>Best candidate: {candidate_count} · Accepted: {accepted_count}</p>"
+        if scores:
+            body += (f"<p>Accepted similarity — mean: {sum(scores)/len(scores):.3f}; "
+                     f"maximum: {max(scores):.3f}; minimum: {min(scores):.3f}</p>")
+            near = sum(1 for score in scores if score < 0.60)
+            body += f"<p>Accepted near threshold (0.55–0.60): {near} / {len(scores)}</p>"
+        if margins:
+            body += f"<p>Mean margin to runner-up identity: {sum(margins)/len(margins):.3f}</p>"
+        body += "<p style='color:#8496a5;font-size:11px'>Observed match statistics are not accuracy or false-positive rates without labeled ground truth.</p>"
+        self.inspector_metrics.setHtml(body)
+        self.copy_report_button.setEnabled(True)
+
+    def copy_inspector_report(self):
+        selected = self.selected_entries()
+        if len(selected) != 1:
+            return
+        entry = selected[0]
+        report = (f"ASIMOV Reference Face Report\n"
+                  f"Reference: {entry.get('name') or 'Unlabelled'}\n"
+                  f"Identity: {entry.get('identity_name') or 'Independent'}\n"
+                  f"Included: {entry.get('included', True)}\n\n"
+                  + self.inspector_metrics.toPlainText())
+        QApplication.clipboard().setText(report)
+        self.message.setText("Reference report copied to clipboard.")
 
     def _count_text(self):
         included = sum(e.get("included", True) for e in self.registry)
@@ -497,16 +698,18 @@ class ReferenceFacesDialog(QDialog):
             return
         self.upload_button.setEnabled(False)
         self.message.setText(f"Processing {len(paths)} image(s)...")
-        self.worker = ReferenceImageWorker(self.parent().api, self.parent().api_lock, paths)
+        self.worker = ReferenceImageWorker(self.parent().api, self.parent().api_lock, paths,
+                                           self.parent().crop_padding, self.parent().crop_mode)
         self.worker.completed.connect(self.on_completed)
         self.worker.finished.connect(self.worker.deleteLater)
         self.worker.start()
 
     def on_completed(self, faces, errors):
         self.upload_button.setEnabled(True)
-        for path, crop, embedding in faces:
+        for path, crop, embedding, quality, face in faces:
             entry = {"name": Path(path).stem, "crop": crop, "embedding": embedding,
-                     "included": True, "source": path, "matches": 0}
+                     "included": True, "source": path, "matches": 0, "quality": quality,
+                     "detected_face": face, "crop_padding": self.parent().crop_padding, "crop_mode": self.parent().crop_mode}
             entry["id"] = id(entry)
             self.registry.append(entry)
         self.render_registry()
@@ -520,6 +723,156 @@ class ReferenceFacesDialog(QDialog):
             event.ignore()
             return
         super().closeEvent(event)
+
+
+class MetricsGraph(QWidget):
+    """Small, dependency-free, dark Qt time-series graph."""
+
+    def __init__(self, title, keys, colors, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.keys = keys
+        self.colors = colors
+        self.samples = []
+        self.setMinimumHeight(175)
+
+    def set_samples(self, samples):
+        self.samples = list(samples)[-120:]
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor('#111923'))
+        painter.setPen(QColor('#dce8ed'))
+        font = painter.font()
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(13, 21, self.title)
+        left, top, right, bottom = 43, 35, self.width() - 12, self.height() - 28
+        if right <= left or bottom <= top:
+            return
+        maximum = max((float(sample.get(key, 0) or 0)
+                       for sample in self.samples for key in self.keys), default=1.0)
+        maximum = max(1.0, maximum * 1.12)
+        for i in range(5):
+            y = int(bottom - (bottom - top) * i / 4)
+            painter.setPen(QPen(QColor('#293744'), 1))
+            painter.drawLine(left, y, right, y)
+            painter.setPen(QColor('#8397a7'))
+            painter.drawText(2, y + 4, f'{maximum * i / 4:.0f}')
+        if len(self.samples) >= 2:
+            for key, color in zip(self.keys, self.colors):
+                painter.setPen(QPen(QColor(color), 2))
+                previous = None
+                for i, sample in enumerate(self.samples):
+                    x = int(left + (right - left) * i / (len(self.samples) - 1))
+                    value = float(sample.get(key, 0) or 0)
+                    y = int(bottom - (bottom - top) * min(value / maximum, 1.0))
+                    if previous is not None:
+                        painter.drawLine(previous[0], previous[1], x, y)
+                    previous = (x, y)
+        painter.setPen(QColor('#8da0ae'))
+        painter.drawText(left, self.height() - 7, 'Older')
+        painter.drawText(right - 38, self.height() - 7, 'Latest')
+
+
+class PerformanceMonitor(QDialog):
+    """Non-modal, low-frequency performance display; no model calls."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle('ASIMOV | Performance Monitor')
+        self.resize(860, 700)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self.setStyleSheet('QDialog {background:#151a21;} QLabel {color:#dce7ed;}')
+        layout = QVBoxLayout(self)
+        heading = QLabel('PERFORMANCE MONITOR')
+        heading.setStyleSheet('font-size:18px;font-weight:700;color:#65d8c1;')
+        layout.addWidget(heading)
+        self.configuration = QLabel('Waiting for frames...')
+        layout.addWidget(self.configuration)
+        metrics = QGridLayout()
+        self.values = {}
+        for i, (key, label) in enumerate((
+            ('fps', 'Processing FPS'), ('det', 'RetinaFace mean'),
+            ('crop', 'Crop / alignment mean'), ('arc', 'ArcFace mean'),
+            ('total', 'Worker mean'), ('gui', 'GUI event-loop delay'),
+            ('frames', 'Processed frames'), ('empty', 'Frames without faces'),
+        )):
+            panel = QFrame()
+            panel.setStyleSheet('QFrame {background:#202b35;border:1px solid #344653;border-radius:7px;}')
+            column = QVBoxLayout(panel)
+            title = QLabel(label)
+            title.setStyleSheet('color:#9eb0bd;font-size:11px;border:none;')
+            value = QLabel('--')
+            value.setStyleSheet('color:#e8f5f2;font-size:19px;font-weight:700;border:none;')
+            column.addWidget(title)
+            column.addWidget(value)
+            metrics.addWidget(panel, i // 4, i % 4)
+            self.values[key] = value
+        layout.addLayout(metrics)
+        self.latency_graph = MetricsGraph('Worker latency (ms)  —  teal: detector  |  orange: ArcFace  |  blue: crop',
+                                          ('detection_ms', 'arcface_ms', 'crop_ms'),
+                                          ('#65d8c1', '#f1b66a', '#76a9e8'))
+        self.gui_graph = MetricsGraph('GUI event-loop delay (ms)', ('gui_delay_ms',), ('#df8cdb',))
+        layout.addWidget(self.latency_graph, 1)
+        layout.addWidget(self.gui_graph, 1)
+        buttons = QHBoxLayout()
+        reset = QPushButton('Reset Metrics')
+        reset.clicked.connect(parent.reset_performance_metrics)
+        buttons.addWidget(reset)
+        copy = QPushButton('Copy Metrics')
+        copy.clicked.connect(self.copy_metrics)
+        buttons.addWidget(copy)
+        buttons.addStretch()
+        close = QPushButton('Close')
+        close.clicked.connect(self.hide)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+        self.timer = QTimer(self)
+        self.timer.setInterval(500)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start()
+        self.refresh()
+
+    def closeEvent(self, event):
+        self.hide()
+        event.ignore()
+
+    def refresh(self):
+        if not self.isVisible():
+            return
+        app = self.parent()
+        rows = list(app.performance_samples)
+        count = len(rows)
+        mean = lambda key: sum(float(row.get(key, 0) or 0) for row in rows) / count if count else 0.0
+        total = mean('worker_total_ms')
+        values = {
+            'fps': f'{1000.0 / total:.2f}' if total > 0 else '--',
+            'det': f'{mean("detection_ms"):.1f} ms' if count else '--',
+            'crop': f'{mean("crop_ms"):.1f} ms' if count else '--',
+            'arc': f'{mean("arcface_ms"):.1f} ms' if count else '--',
+            'total': f'{total:.1f} ms' if count else '--',
+            'gui': f'{app.gui_delay_ms:.1f} ms',
+            'frames': str(app.performance_frame_count),
+            'empty': str(app.performance_empty_count),
+        }
+        for key, value in values.items():
+            self.values[key].setText(value)
+        self.configuration.setText(
+            f'{app.crop_mode} | padding {app.crop_padding:.0%} | '
+            f'no frame skipping: {app.no_skip_checkbox.isChecked()} | '
+            f'inference: {app.inference_scale_combo.currentText()} | '
+            f'window: last {count} frames')
+        self.latency_graph.set_samples(rows)
+        self.gui_graph.set_samples(app.gui_delay_samples)
+
+    def copy_metrics(self):
+        self.refresh()
+        text = 'ASIMOV Performance Monitor\n' + self.configuration.text() + '\n'
+        text += '\n'.join(f'{key}: {label.text()}' for key, label in self.values.items())
+        QApplication.clipboard().setText(text)
 
 
 class BasicVideoApp(QMainWindow):
@@ -559,6 +912,13 @@ class BasicVideoApp(QMainWindow):
         self.diagnostic_limit = 10000
         self.diagnostic_dirty = False
         self.recent_recognitions = deque(maxlen=100)
+        self.performance_samples = deque(maxlen=300)
+        self.gui_delay_samples = deque(maxlen=120)
+        self.performance_frame_count = 0
+        self.performance_empty_count = 0
+        self.gui_delay_ms = 0.0
+        self.performance_monitor = None
+        self.recognized_refresh_dirty = False
 
         # Build Qt UI before starting the worker.
         self.build_interface()
@@ -570,6 +930,11 @@ class BasicVideoApp(QMainWindow):
         self.api = API()
         self.api_lock = Lock()
         self.face_registry = []
+        self.crop_padding = 0.0
+        self.crop_mode = "legacy"
+        self.recrop_worker = None
+        self._previous_crop_padding = 0.0
+        # Statistics are session-only and belong to individual reference images.
         self.identity_colors = {}
 
         self.detection_worker = DetectionWorker(self.api, self.api_lock)
@@ -580,6 +945,16 @@ class BasicVideoApp(QMainWindow):
             self.on_detection_error
         )
         self.detection_worker.start()
+        self.reference_refresh_timer = QTimer(self)
+        self.reference_refresh_timer.setInterval(400)
+        self.reference_refresh_timer.timeout.connect(self.flush_reference_refresh)
+        self.reference_refresh_timer.start()
+        self.gui_heartbeat_last = time.perf_counter()
+        self.gui_heartbeat = QTimer(self)
+        self.gui_heartbeat.setInterval(100)
+        self.gui_heartbeat.timeout.connect(self.measure_gui_latency)
+        self.gui_heartbeat.start()
+        self.reference_refresh_dirty = False
 
         # Playback timer.
         self.timer = QTimer(self)
@@ -588,6 +963,11 @@ class BasicVideoApp(QMainWindow):
 
         self.update_controls()
         self.refresh_reference_strip()
+
+    def toggle_advanced_controls(self, expanded):
+        """Show or hide inference options within the original toolbar frame."""
+        self.advanced_controls.setVisible(expanded)
+        self.options_button.setText("⌃" if expanded else "⌄")
 
     def build_interface(self):
         central = QWidget()
@@ -684,11 +1064,10 @@ class BasicVideoApp(QMainWindow):
         root.addWidget(self.video_slider)
 
         # Player toolbar.
-        toolbar = QFrame()
-        toolbar.setObjectName("toolbar")
-
+        toolbar = QWidget()
+        toolbar.setObjectName("toolbarTopRow")
         toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(14, 12, 14, 12)
+        toolbar_layout.setContentsMargins(14, 6, 14, 6)
         toolbar_layout.setSpacing(10)
 
         self.play_button = QPushButton("Play")
@@ -713,7 +1092,7 @@ class BasicVideoApp(QMainWindow):
         toolbar_layout.addWidget(self.pause_button)
         toolbar_layout.addWidget(self.stop_button)
 
-        toolbar_layout.addStretch()
+        toolbar_layout.addStretch(1)
 
         self.detection_checkbox = QCheckBox("Face detection")
         self.detection_checkbox.setChecked(False)
@@ -740,16 +1119,63 @@ class BasicVideoApp(QMainWindow):
         self.no_skip_checkbox.toggled.connect(self.on_inference_options_changed)
         toolbar_layout.addSpacing(14)
         toolbar_layout.addWidget(self.no_skip_checkbox)
+        self.options_button = QToolButton()
+        self.options_button.setText("⌄")
+        self.options_button.setObjectName("toolbarChevron")
+        self.options_button.setCheckable(True)
+        self.options_button.setToolTip("Show or hide inference and recognition settings")
+        self.options_button.toggled.connect(self.toggle_advanced_controls)
+        toolbar_layout.addSpacing(12)
+        toolbar_layout.addWidget(self.options_button)
 
-        toolbar_layout.addSpacing(14)
-        toolbar_layout.addWidget(QLabel("Inference resolution:"))
+        options_toolbar = QWidget()
+        options_toolbar.setObjectName("toolbarOptionsRow")
+        options_layout = QHBoxLayout(options_toolbar)
+        options_layout.setContentsMargins(14, 6, 14, 6)
+        options_layout.setSpacing(10)
+
+        options_layout.addStretch(1)
+        options_layout.addWidget(QLabel("Inference resolution:"))
         self.inference_scale_combo = QComboBox()
         for label, scale in (("100%", 1.0), ("75%", 0.75), ("50%", 0.5), ("25%", 0.25)):
             self.inference_scale_combo.addItem(label, scale)
         self.inference_scale_combo.currentIndexChanged.connect(self.on_inference_options_changed)
-        toolbar_layout.addWidget(self.inference_scale_combo)
+        options_layout.addWidget(self.inference_scale_combo)
 
-        root.addWidget(toolbar)
+        options_layout.addSpacing(10)
+        options_layout.addWidget(QLabel("Crop padding:"))
+        self.crop_padding_combo = QComboBox()
+        self.crop_padding_combo.setToolTip("Enlarge both reference and video face crops; changing this rebuilds reference embeddings")
+        for label, value in (("0%", 0.0), ("+10%", 0.10), ("+15%", 0.15)):
+            self.crop_padding_combo.addItem(label, value)
+        self.crop_padding_combo.currentIndexChanged.connect(self.on_crop_padding_changed)
+        options_layout.addWidget(self.crop_padding_combo)
+
+        options_layout.addSpacing(10)
+        options_layout.addWidget(QLabel("Recognition preprocessing:"))
+        self.crop_mode_combo = QComboBox()
+        self.crop_mode_combo.addItem("Legacy crop", "legacy")
+        self.crop_mode_combo.addItem("5-point aligned (112×112)", "aligned")
+        self.crop_mode_combo.setToolTip("Rebuilds reference embeddings from the original images; uses RetinaFace landmarks")
+        self.crop_mode_combo.currentIndexChanged.connect(self.on_crop_padding_changed)
+        options_layout.addWidget(self.crop_mode_combo)
+
+        # A single frame and ordinary Qt visibility toggle: no custom resize grip,
+        # nested scroll viewport, or mouse-driven geometry changes.
+        self.controls_panel = QFrame()
+        self.controls_panel.setObjectName("toolbar")
+        panel_layout = QVBoxLayout(self.controls_panel)
+        panel_layout.setContentsMargins(8, 5, 8, 5)
+        panel_layout.setSpacing(0)
+        panel_layout.addWidget(toolbar)
+        self.advanced_controls = options_toolbar
+        panel_layout.addWidget(self.advanced_controls)
+        self.advanced_controls.hide()
+        self.controls_panel.setStyleSheet(
+            'QFrame#toolbar QLabel { background:transparent; border:none; }'
+            'QFrame#toolbar QCheckBox { background:transparent; }'
+        )
+        root.addWidget(self.controls_panel)
 
         # Two independent collapsible strips share a single row.
         # Both are closed initially to prioritize the video preview.
@@ -790,9 +1216,9 @@ class BasicVideoApp(QMainWindow):
         self.recognized_toggle.toggled.connect(self.toggle_recognized_strip)
         recognized_panel_layout.addWidget(self.recognized_toggle)
         self.recognized_scroll = QScrollArea()
-        self.recognized_scroll.setWidgetResizable(True)
-        self.recognized_scroll.setFixedHeight(94)
-        self.recognized_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.recognized_scroll.setWidgetResizable(False)
+        self.recognized_scroll.setFixedHeight(112)
+        self.recognized_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.recognized_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.recognized_strip_widget = QWidget()
         self.recognized_strip_layout = QHBoxLayout(self.recognized_strip_widget)
@@ -816,7 +1242,7 @@ class BasicVideoApp(QMainWindow):
         filters = QHBoxLayout()
         filters.addWidget(QLabel("Show:"))
         self.diagnostic_filter = QComboBox()
-        self.diagnostic_filter.addItems(["All", "Detection", "Recognition"])
+        self.diagnostic_filter.addItems(["All", "Detection", "Recognition", "Performance"])
         self.diagnostic_filter.currentTextChanged.connect(self.refresh_diagnostics)
         self.matched_only = QCheckBox("Above threshold (accepted matches only)")
         self.matched_only.toggled.connect(self.refresh_diagnostics)
@@ -862,10 +1288,52 @@ class BasicVideoApp(QMainWindow):
         # Build the menu only after all interface controls exist.
         self.build_menu()
 
+    def measure_gui_latency(self):
+        now = time.perf_counter()
+        self.gui_delay_ms = max(0.0, (now - self.gui_heartbeat_last) * 1000.0 - 100.0)
+        self.gui_heartbeat_last = now
+        self.gui_delay_samples.append({"gui_delay_ms": self.gui_delay_ms})
+
+    def reset_performance_metrics(self):
+        self.performance_samples.clear()
+        self.gui_delay_samples.clear()
+        self.performance_frame_count = 0
+        self.performance_empty_count = 0
+        self.gui_delay_ms = 0.0
+        self.gui_heartbeat_last = time.perf_counter()
+        self.status_label.setText("Performance metrics reset (recognition counters preserved)")
+        if self.performance_monitor is not None:
+            self.performance_monitor.refresh()
+
+    def open_performance_monitor(self):
+        if self.performance_monitor is None:
+            self.performance_monitor = PerformanceMonitor(self)
+        self.performance_monitor.show()
+        self.performance_monitor.raise_()
+        self.performance_monitor.activateWindow()
+        self.performance_monitor.refresh()
+
+    def flush_reference_refresh(self):
+        if self.recognized_refresh_dirty:
+            self.recognized_refresh_dirty = False
+            if self.recognized_toggle.isChecked():
+                self.refresh_recognized_strip()
+        if self.reference_refresh_dirty:
+            self.reference_refresh_dirty = False
+            if self.reference_toggle.isChecked():
+                for entry in self.face_registry:
+                    label = getattr(self, "reference_count_widgets", {}).get(entry.get("id"))
+                    if label is not None:
+                        label.setText(str(entry.get("matches", 0)))
+                        label.adjustSize()
+                        label.resize(max(17, label.width()), 16)
+                        label.move(label.parentWidget().width() - label.width() - 1, label.parentWidget().height() - 17)
+
     def refresh_reference_strip(self):
         if not hasattr(self, "reference_strip_layout") or not hasattr(self, "face_registry"):
             return
         layout = self.reference_strip_layout
+        self.reference_count_widgets = {}
         while layout.count():
             item = layout.takeAt(0)
             if item.widget():
@@ -916,6 +1384,7 @@ class BasicVideoApp(QMainWindow):
                     "border: 1px solid rgba(255,255,255,65); border-radius: 8px; "
                     "font-size: 10px; font-weight: 700; padding: 0px 3px; }"
                 )
+                self.reference_count_widgets[entry.get("id")] = count
                 count.adjustSize()
                 count.resize(max(17, count.width()), 16)
                 count.move(preview.width() - count.width() - 1, preview.height() - 17)
@@ -939,24 +1408,23 @@ class BasicVideoApp(QMainWindow):
         self.recognized_scroll.setVisible(expanded)
         self.refresh_recognized_strip()
 
-    def recognized_capacity(self):
-        # Each cell uses 71 px including spacing; avoid horizontal scrolling.
-        width = self.recognized_scroll.viewport().width()
-        return max(1, (max(0, width - 12) + 6) // 77)
-
     def refresh_recognized_strip(self):
         if not hasattr(self, "recognized_strip_layout"):
             return
         arrow = "▾" if self.recognized_toggle.isChecked() else "▸"
         self.recognized_toggle.setText(
             f"Recognized Faces ({len(self.recent_recognitions)} recent)  {arrow}")
+        scrollbar = self.recognized_scroll.horizontalScrollBar()
+        old_position = scrollbar.value()
+        follow_latest = old_position >= scrollbar.maximum() - 12
         layout = self.recognized_strip_layout
         while layout.count():
             item = layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        for event in list(self.recent_recognitions)[-self.recognized_capacity():]:
+        for event in self.recent_recognitions:
             cell = QWidget()
+            cell.setFixedWidth(71)
             column = QVBoxLayout(cell)
             column.setContentsMargins(2, 0, 2, 0)
             column.setSpacing(1)
@@ -977,6 +1445,15 @@ class BasicVideoApp(QMainWindow):
             column.addWidget(label)
             layout.addWidget(cell)
         layout.addStretch()
+        # Explicit content width exposes the native horizontal scrollbar.
+        count = len(self.recent_recognitions)
+        content_width = 12 + count * 71 + max(0, count - 1) * 6
+        self.recognized_strip_widget.setFixedWidth(max(
+            self.recognized_scroll.viewport().width(), content_width))
+        if follow_latest:
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            scrollbar.setValue(min(old_position, scrollbar.maximum()))
 
     def add_recognized_crop(self, detection, frame_number):
         crop = detection.get("accepted_crop")
@@ -989,12 +1466,15 @@ class BasicVideoApp(QMainWindow):
             "name": detection["name"],
             "seconds": frame_number / self.video_fps if self.video_fps else 0,
         })
-        self.refresh_recognized_strip()
+        self.recognized_refresh_dirty = True
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if hasattr(self, "controls_view"):
+            self.controls_content.setFixedWidth(max(1, self.controls_view.viewport().width()))
         if hasattr(self, "recognized_scroll") and hasattr(self, "recent_recognitions"):
-            self.refresh_recognized_strip()
+            if self.recognized_toggle.isChecked():
+                self.refresh_recognized_strip()
 
     def toggle_diagnostics(self, expanded):
         self.diagnostic_panel.setVisible(expanded)
@@ -1045,7 +1525,7 @@ class BasicVideoApp(QMainWindow):
         selected = self.diagnostic_filter.currentText()
         matched_only = self.matched_only.isChecked()
         lines = []
-        for category, line, identity, accepted, metadata in self.diagnostic_events:
+        for category, line, identity, accepted, metadata in self.diagnostic_events[-600:]:
             if selected != "All" and category != selected:
                 continue
             if matched_only and not accepted:
@@ -1053,6 +1533,7 @@ class BasicVideoApp(QMainWindow):
             color = self.color_for_identity(identity) if identity else (
                 "#90a7b8" if category == "Detection" else "#a6adb5")
             lines.append(f'<span style="color:{color};">{html.escape(line)}</span>')
+        lines = lines[-300:]  # Keep the live text widget bounded; full history remains exportable.
         self.diagnostic_text.setHtml(
             '<div style="font-family:Consolas,monospace; font-size:11px; white-space:pre;">'
             + '<br>'.join(lines) + '</div>')
@@ -1068,6 +1549,7 @@ class BasicVideoApp(QMainWindow):
     def reset_match_counters(self):
         for entry in self.face_registry:
             entry["matches"] = 0
+            entry.pop("recognition_stats", None)
         self.refresh_reference_strip()
         self.status_label.setText("Reference match counters reset")
 
@@ -1083,7 +1565,15 @@ class BasicVideoApp(QMainWindow):
             return
         columns = ["video_time_seconds", "frame_number", "event_type", "identity",
                    "accepted", "face_width", "face_height", "detection_confidence",
-                   "best_reference", "best_reference_id", "similarity", "threshold", "message"]
+                   "best_reference", "best_reference_id", "similarity", "threshold",
+                   "runner_up_identity", "runner_up_similarity", "score_margin",
+                   "best_candidate_reference_id", "message",
+                   "video_filename", "no_frame_skipping", "inference_scale",
+                   "preprocessing_mode", "crop_padding", "recognition_enabled",
+                   "reference_count", "source_video_fps", "detection_ms",
+                   "embedding_ms", "worker_total_ms", "embedding_count",
+                    "processed_face_count", "inference_width", "inference_height",
+                    "crop_ms", "arcface_ms"]
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as output:
                 writer = csv.DictWriter(output, fieldnames=columns)
@@ -1091,7 +1581,15 @@ class BasicVideoApp(QMainWindow):
                 for category, line, identity, accepted, metadata in self.diagnostic_events:
                     row = {key: metadata.get(key, "") for key in columns}
                     row.update(event_type=category, identity=identity or "",
-                               accepted=accepted, message=line)
+                               accepted=accepted, message=line,
+                               video_filename=Path(self.video_path).name if self.video_path else "",
+                               no_frame_skipping=self.no_skip_checkbox.isChecked(),
+                               inference_scale=self.inference_scale_combo.currentData(),
+                               preprocessing_mode=self.crop_mode,
+                               crop_padding=self.crop_padding,
+                               recognition_enabled=self.recognition_checkbox.isChecked(),
+                               reference_count=sum(bool(e.get("included", True)) for e in self.face_registry),
+                               source_video_fps=self.video_fps)
                     writer.writerow(row)
         except OSError as exc:
             QMessageBox.warning(self, "Export Failed", str(exc))
@@ -1134,6 +1632,15 @@ class BasicVideoApp(QMainWindow):
         playback_menu.addAction(play_action)
         playback_menu.addAction(pause_action)
         playback_menu.addAction(stop_action)
+
+        monitor_menu = menu_bar.addMenu("&Monitor")
+        monitor_action = QAction("Performance Monitor...", self)
+        monitor_action.setShortcut("Ctrl+M")
+        monitor_action.triggered.connect(self.open_performance_monitor)
+        monitor_menu.addAction(monitor_action)
+        reset_metrics_action = QAction("Reset Performance Metrics", self)
+        reset_metrics_action.triggered.connect(self.reset_performance_metrics)
+        monitor_menu.addAction(reset_metrics_action)
 
         settings_menu = menu_bar.addMenu("&Settings")
 
@@ -1237,6 +1744,21 @@ class BasicVideoApp(QMainWindow):
                 border: 1px solid #303b46;
                 border-radius: 8px;
             }
+
+            QWidget#toolbarTopRow, QWidget#toolbarOptionsRow {
+                background-color: #202832;
+                border: none;
+            }
+
+            QToolButton#toolbarChevron {
+                background: transparent;
+                border: none;
+                color: #b7c7d3;
+                padding: 0px 6px;
+                font-size: 19px;
+                font-weight: 600;
+            }
+            QToolButton#toolbarChevron:hover { color: #65d8c1; }
 
             QPushButton {
                 background-color: #303b46;
@@ -1381,6 +1903,82 @@ class BasicVideoApp(QMainWindow):
 
         self.video_capture = capture
         return True
+
+    def on_crop_padding_changed(self, *_):
+        requested_mode = str(self.crop_mode_combo.currentData())
+        requested = float(self.crop_padding_combo.currentData())
+        # Alignment uses the standard 112x112 template; padding only applies to legacy mode.
+        if requested == self.crop_padding and requested_mode == self.crop_mode:
+            return
+        if self.recrop_worker is not None and self.recrop_worker.isRunning():
+            self.crop_padding_combo.blockSignals(True)
+            self.crop_padding_combo.setCurrentIndex(self.crop_padding_combo.findData(self.crop_padding))
+            self.crop_padding_combo.blockSignals(False)
+            self.crop_mode_combo.blockSignals(True)
+            self.crop_mode_combo.setCurrentIndex(self.crop_mode_combo.findData(self.crop_mode))
+            self.crop_mode_combo.blockSignals(False)
+            return
+        # Previously imported entries must carry their source detection, so
+        # embeddings can be recomputed without invoking RetinaFace again.
+        if any("detected_face" not in e for e in self.face_registry):
+            QMessageBox.warning(self, "Reimport required",
+                "Some references were imported by an older version. Reimport them before changing crop padding.")
+            self.crop_padding_combo.blockSignals(True)
+            self.crop_padding_combo.setCurrentIndex(self.crop_padding_combo.findData(self.crop_padding))
+            self.crop_padding_combo.blockSignals(False)
+            self.crop_mode_combo.blockSignals(True)
+            self.crop_mode_combo.setCurrentIndex(self.crop_mode_combo.findData(self.crop_mode))
+            self.crop_mode_combo.blockSignals(False)
+            return
+        if not self.face_registry:
+            self.crop_padding = requested
+            self.crop_mode = requested_mode
+            self.clear_detection()
+            self.status_label.setText(f"Preprocessing: {requested_mode}; padding +{requested:.0%}")
+            return
+        self.pause_video()
+        self.clear_detection()
+        self.crop_padding_combo.setEnabled(False)
+        self.crop_mode_combo.setEnabled(False)
+        self.reference_button.setEnabled(False)
+        self.status_label.setText("Rebuilding reference embeddings from source images…")
+        self.recrop_worker = ReferenceRecropWorker(self.api, self.api_lock, self.face_registry, requested, requested_mode)
+        self.recrop_worker.completed.connect(lambda updates, errors, p=requested, m=requested_mode: self.on_recrop_completed(p, m, updates, errors))
+        self.recrop_worker.start()
+
+    def on_recrop_completed(self, requested, requested_mode, updates, errors):
+        # The completion signal is emitted just before the QThread exits.
+        # Wait before dropping its last Python reference.
+        self.recrop_worker.wait()
+        # Commit only if ALL embeddings succeeded, to avoid mixing settings.
+        if errors or len(updates) != len(self.face_registry):
+            self.crop_padding_combo.blockSignals(True)
+            self.crop_padding_combo.setCurrentIndex(self.crop_padding_combo.findData(self.crop_padding))
+            self.crop_padding_combo.blockSignals(False)
+            self.crop_mode_combo.blockSignals(True)
+            self.crop_mode_combo.setCurrentIndex(self.crop_mode_combo.findData(self.crop_mode))
+            self.crop_mode_combo.blockSignals(False)
+            QMessageBox.warning(self, "Crop experiment", "Could not rebuild every reference:\n" +
+                                "\n".join(errors[:15]))
+            self.status_label.setText("Crop padding unchanged")
+        else:
+            for entry in self.face_registry:
+                entry["crop"], entry["embedding"] = updates[entry["id"]]
+                entry["crop_padding"] = requested
+                entry["crop_mode"] = requested_mode
+                entry["matches"] = 0
+                entry.pop("recognition_stats", None)
+            self.crop_padding = requested
+            self.crop_mode = requested_mode
+            self.clear_diagnostics()
+            self.recent_recognitions.clear()
+            self.refresh_recognized_strip()
+            self.refresh_reference_strip()
+            self.status_label.setText(f"Preprocessing: {requested_mode}; padding +{requested:.0%}; embeddings rebuilt; counters reset")
+        self.crop_padding_combo.setEnabled(True)
+        self.crop_mode_combo.setEnabled(True)
+        self.reference_button.setEnabled(True)
+        self.recrop_worker = None
 
     def open_reference_faces(self):
         dialog = ReferenceFacesDialog(self)
@@ -1615,6 +2213,9 @@ class BasicVideoApp(QMainWindow):
         if generation != self.detection_generation:
             return
 
+        if self.no_skip_checkbox.isChecked():
+            self.inference_pending = False
+
         if not self.detection_checkbox.isChecked():
             return
 
@@ -1633,6 +2234,18 @@ class BasicVideoApp(QMainWindow):
         else:
             self.inference_pending = False
 
+        # Strip internal timing payload before drawing boxes or counting faces.
+        timing = next((d["_performance"] for d in detections if "_performance" in d), None)
+        detections = [d for d in detections if "_performance" not in d]
+        if timing is not None:
+            self.performance_samples.append(timing)
+            self.performance_frame_count += 1
+            if not timing.get("processed_face_count", 0):
+                self.performance_empty_count += 1
+            self.add_diagnostic(
+                "Performance",
+                f"Detector {timing['detection_ms']:.1f} ms · crops + ArcFace {timing['embedding_ms']:.1f} ms · worker {timing['worker_total_ms']:.1f} ms",
+                frame_number, metadata=timing)
         self.latest_detections = detections
         self.latest_detection_frame = frame_number
         counts_changed = False
@@ -1647,6 +2260,20 @@ class BasicVideoApp(QMainWindow):
                 accepted = bool(detection.get("name") and detection["name"] != "Unknown")
                 identity = detection.get("name") if accepted else detection.get("best_name")
                 reference_id = detection.get("best_reference_id")
+                candidate_id = detection.get("best_candidate_reference_id")
+                if candidate_id is not None:
+                    candidate_entry = next((e for e in self.face_registry if e.get("id") == candidate_id), None)
+                    if candidate_entry is not None:
+                        stats = candidate_entry.setdefault("recognition_stats", {
+                            "candidate_count": 0, "accepted_count": 0,
+                            "accepted_scores": [], "accepted_margins": []})
+                        stats["candidate_count"] += 1
+                        if accepted and score is not None:
+                            stats["accepted_count"] += 1
+                            stats["accepted_scores"].append(float(score))
+                            margin = detection.get("score_margin")
+                            if margin is not None:
+                                stats["accepted_margins"].append(float(margin))
                 if accepted:
                     self.add_recognized_crop(detection, frame_number)
                 if accepted and reference_id is not None:
@@ -1661,9 +2288,13 @@ class BasicVideoApp(QMainWindow):
                                               "best_reference": detection.get("best_reference_label") or "",
                                               "best_reference_id": reference_id or "",
                                               "similarity": score if score is not None else "",
-                                              "threshold": 0.55})
+                                              "threshold": 0.55,
+                                              "runner_up_identity": detection.get("runner_up_name") or "",
+                                              "runner_up_similarity": detection.get("runner_up_score") if detection.get("runner_up_score") is not None else "",
+                                              "score_margin": detection.get("score_margin") if detection.get("score_margin") is not None else "",
+                                              "best_candidate_reference_id": candidate_id or ""})
         if counts_changed:
-            self.refresh_reference_strip()
+            self.reference_refresh_dirty = True
 
     @staticmethod
     def annotate_frame(frame, detections):
@@ -1871,6 +2502,8 @@ class BasicVideoApp(QMainWindow):
                 tuple(references),
                 # Original dimensions are needed to restore coordinates.
                 (frame.shape[1], frame.shape[0]),
+                self.crop_padding,
+                self.crop_mode,
             )
             if sequential:
                 self.inference_pending = True
@@ -1909,6 +2542,9 @@ class BasicVideoApp(QMainWindow):
 
     def closeEvent(self, event):
         self.timer.stop()
+
+        if self.recrop_worker is not None and self.recrop_worker.isRunning():
+            self.recrop_worker.wait()
 
         self.detection_worker.stop()
 
