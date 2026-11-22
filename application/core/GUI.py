@@ -3,7 +3,9 @@ import os
 import html
 import colorsys
 import csv
+import json
 import uuid
+import random
 
 # Initialize TensorFlow before PyQt5 on Windows.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
@@ -176,6 +178,7 @@ class DetectionWorker(QThread):
                     runner_up_score = None
                     score_margin = None
                     best_candidate_reference_id = None
+                    reference_scores = []
                     if vector is not None and np.all(np.isfinite(vector)):
                         magnitude = np.linalg.norm(vector)
                         if magnitude > 0:
@@ -183,8 +186,10 @@ class DetectionWorker(QThread):
                             candidates = []
                             for ref_id, identity_id, identity_name, reference_label, ref_vector in references:
                                 if ref_vector.shape == normalized.shape:
-                                    candidates.append((float(np.dot(normalized, ref_vector)),
-                                                       identity_id, identity_name, ref_id, reference_label))
+                                    score = float(np.dot(normalized, ref_vector))
+                                    candidates.append((score, identity_id, identity_name, ref_id, reference_label))
+                                    reference_scores.append({"reference": reference_label, "identity": identity_name,
+                                                             "score": round(score, 6)})
                             # Compare each reference, but rank identities using their best image.
                             # Ungrouped references retain independent identity IDs.
                             by_identity = {}
@@ -211,6 +216,9 @@ class DetectionWorker(QThread):
 
                     detections.append({
                         "accepted_crop": accepted_crop,
+                        "reference_scores": reference_scores,
+                        "review_crop": (cv2.resize(recognition_crop, (96, 96), interpolation=cv2.INTER_AREA)
+                                        if recognition_crop is not None and recognition_crop.size else None),
                         "name": name,
                         "best_name": best_name,
                         "best_reference_label": best_reference_label,
@@ -563,7 +571,7 @@ class ReferenceFacesDialog(QDialog):
             return "N/A" if value is None else f"{value}{suffix}"
         size = metrics.get("face_size", (0, 0))
         rows = [
-            ("Detection confidence", fmt("confidence")),
+            ("Detection confidence", (f"{float(metrics['confidence']) * 100:.4f}%" if metrics.get("confidence") is not None else "N/A")),
             ("Face size", f"{size[0]} × {size[1]} px"),
             ("Image coverage", fmt("face_coverage", "%")),
             ("Face-region sharpness (160px)", fmt("sharpness")),
@@ -590,20 +598,44 @@ class ReferenceFacesDialog(QDialog):
             body += "<p style='color:#65d8c1'>No heuristic warnings</p>"
         body += "<p style='color:#8496a5;font-size:11px'>Pose and quality indicators are heuristic, not validated recognition-accuracy scores.</p>"
         stats = entry.get("recognition_stats") or {}
-        candidate_count = stats.get("candidate_count", 0)
-        accepted_count = stats.get("accepted_count", 0)
+        candidate_count = int(stats.get("candidate_count", 0))
+        accepted_count = int(stats.get("accepted_count", 0))
         scores = stats.get("accepted_scores", [])
         margins = stats.get("accepted_margins", [])
         body += "<hr><b>REFERENCE PERFORMANCE</b>"
-        body += f"<p>Best candidate: {candidate_count} · Accepted: {accepted_count}</p>"
+        body += (f"<p>Top-scoring reference: <b>{candidate_count}</b> detections; "
+                 f"accepted identity matches: <b>{accepted_count}</b></p>")
+        if candidate_count:
+            body += f"<p>Acceptance among top-scoring candidates: {100 * accepted_count / candidate_count:.1f}%</p>"
         if scores:
-            body += (f"<p>Accepted similarity — mean: {sum(scores)/len(scores):.3f}; "
-                     f"maximum: {max(scores):.3f}; minimum: {min(scores):.3f}</p>")
-            near = sum(1 for score in scores if score < 0.60)
-            body += f"<p>Accepted near threshold (0.55–0.60): {near} / {len(scores)}</p>"
+            ordered = sorted(scores)
+            def percentile(p):
+                position = (len(ordered) - 1) * p
+                lower = int(position)
+                upper = min(lower + 1, len(ordered) - 1)
+                return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+            body += (f"<p>Accepted cosine similarity — mean: {sum(scores)/len(scores):.3f}; "
+                     f"median: {percentile(.5):.3f}; "
+                     f"min/max: {ordered[0]:.3f} / {ordered[-1]:.3f}</p>")
+            body += (f"<p>Similarity spread (P10–P90): "
+                     f"{percentile(.1):.3f}–{percentile(.9):.3f}</p>")
+            bands = ((.55, .60), (.60, .70), (.70, 1.001))
+            labels = ("0.55–0.60", "0.60–0.70", "0.70–1.00")
+            body += "<p><b>Accepted similarity distribution</b></p>"
+            for (lo, hi), label in zip(bands, labels):
+                count = sum(lo <= value < hi for value in scores)
+                body += f"<p style='margin:3px 0'>{label}: {count} ({100 * count / len(scores):.1f}%)</p>"
+        else:
+            body += "<p>No accepted similarity observations yet.</p>"
         if margins:
-            body += f"<p>Mean margin to runner-up identity: {sum(margins)/len(margins):.3f}</p>"
-        body += "<p style='color:#8496a5;font-size:11px'>Observed match statistics are not accuracy or false-positive rates without labeled ground truth.</p>"
+            body += (f"<p>Margin over runner-up identity — mean: "
+                     f"{sum(margins)/len(margins):.3f}; min: {min(margins):.3f}</p>")
+        else:
+            body += "<p>Runner-up margin: no observations (or no runner-up identity).</p>"
+        body += ("<p style='color:#8496a5;font-size:11px'>Statistics describe processed detections, "
+                 "not independent people or frames. A reference can win the candidate ranking "
+                 "without being accepted. These measurements cannot establish accuracy or "
+                 "false-positive rates without labeled ground truth.</p>")
         self.inspector_metrics.setHtml(body)
         self.copy_report_button.setEnabled(True)
 
@@ -875,6 +907,396 @@ class PerformanceMonitor(QDialog):
         QApplication.clipboard().setText(text)
 
 
+class RecognitionReview(QDialog):
+    """Review predictions against human labels without invoking the models."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("ASIMOV | Recognition Review")
+        self.resize(1000, 690)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self.setStyleSheet("QDialog {background:#151a21;} QLabel {color:#dce7ed;} "
+                           "QListWidget {background:#1b242d;color:#dce7ed;border:1px solid #344653;} "
+                           "QTextEdit {background:#1b242d;color:#dce7ed;border:1px solid #344653;} ")
+        self.current_key = None
+        self.sample_keys = None
+        self.sample_video = None
+        root = QVBoxLayout(self)
+        heading = QLabel("RECOGNITION REVIEW")
+        heading.setStyleSheet("font-size:18px;font-weight:700;color:#65d8c1;")
+        root.addWidget(heading)
+        explanation = QLabel("Select the actual person. Click once to assess and advance; 1–9 = reference, 0 = Unknown.")
+        root.addWidget(explanation)
+        filters = QHBoxLayout()
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(["Unreviewed", "All detections", "Reviewed", "Accepted", "Rejected"])
+        self.filter_combo.currentIndexChanged.connect(self.refresh)
+        filters.addWidget(self.filter_combo)
+        self.sample_button = QPushButton("Generate 100-face test sample")
+        self.sample_button.setToolTip("80 px minimum face width; at least 1 second between samples; includes Unknown")
+        self.sample_button.clicked.connect(self.generate_sample)
+        filters.addWidget(self.sample_button)
+        self.all_button = QPushButton("Show all")
+        self.all_button.clicked.connect(self.show_all)
+        filters.addWidget(self.all_button)
+        self.summary = QLabel()
+        filters.addWidget(self.summary)
+        filters.addStretch()
+        root.addLayout(filters)
+        split = QSplitter(Qt.Horizontal)
+        self.history = QListWidget()
+        self.history.setIconSize(QSize(66, 66))
+        self.history.setSpacing(3)
+        self.history.currentItemChanged.connect(self.select_item)
+        split.addWidget(self.history)
+        details = QWidget()
+        detail_layout = QVBoxLayout(details)
+        self.preview = QLabel("Select a detection")
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setFixedHeight(215)
+        detail_layout.addWidget(self.preview)
+        self.decision = QLabel("Prediction: —")
+        self.decision.setStyleSheet("font-weight:600;font-size:14px;color:#65d8c1;")
+        detail_layout.addWidget(self.decision)
+        self.score_summary = QLabel("Scores: —")
+        self.score_summary.setWordWrap(True)
+        detail_layout.addWidget(self.score_summary)
+        self.quick_label = QLabel("ACTUAL IDENTITY — click to assess")
+        self.quick_label.setStyleSheet("font-weight:600;color:#b4c6d0;")
+        detail_layout.addWidget(self.quick_label)
+        self.quick_buttons = QWidget()
+        self.quick_grid = QGridLayout(self.quick_buttons)
+        self.quick_grid.setContentsMargins(0, 0, 0, 0)
+        self.quick_grid.setSpacing(6)
+        detail_layout.addWidget(self.quick_buttons)
+        self.details = QTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setFixedHeight(105)
+        self.details.setPlaceholderText("Additional detection information")
+        detail_layout.addWidget(self.details)
+        clear = QPushButton("Clear assessment")
+        clear.clicked.connect(self.clear_truth)
+        detail_layout.addWidget(clear)
+        detail_layout.addStretch()
+        split.addWidget(details)
+        split.setSizes([430, 570])
+        root.addWidget(split, 1)
+        buttons = QHBoxLayout()
+        export = QPushButton("Export Review CSV")
+        export.clicked.connect(self.export_csv)
+        buttons.addWidget(export)
+        save = QPushButton("Save Assessments...")
+        save.clicked.connect(self.save_labels)
+        buttons.addWidget(save)
+        load = QPushButton("Load Assessments...")
+        load.clicked.connect(self.load_labels)
+        buttons.addWidget(load)
+        buttons.addStretch()
+        close = QPushButton("Close")
+        close.clicked.connect(self.hide)
+        buttons.addWidget(close)
+        root.addLayout(buttons)
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.setInterval(750)
+        self.refresh_timer.timeout.connect(self.refresh_if_dirty)
+        self.refresh_timer.start()
+        from PyQt5.QtWidgets import QShortcut
+        from PyQt5.QtGui import QKeySequence
+        self._shortcuts = []
+        for digit in range(10):
+            shortcut = QShortcut(QKeySequence(str(digit)), self)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(lambda d=digit: self.quick_key(d))
+            self._shortcuts.append(shortcut)
+        self.refresh()
+
+    def closeEvent(self, event):
+        self.hide()
+        event.ignore()
+
+    def refresh_if_dirty(self):
+        if self.isVisible() and self.parent().review_dirty:
+            self.parent().review_dirty = False
+            self.refresh()
+
+    def refresh(self, *_):
+        app = self.parent()
+        selected = self.current_key
+        mode = self.filter_combo.currentText()
+        self.history.blockSignals(True)
+        self.history.clear()
+        visible = []
+        for event in app.review_events:
+            if self.sample_keys is not None and event["key"] not in self.sample_keys:
+                continue
+            truth = app.review_labels.get(event["key"])
+            accepted = event["prediction"] != "Unknown"
+            if mode == "Unreviewed" and truth is not None: continue
+            if mode == "Reviewed" and truth is None: continue
+            if mode == "Accepted" and not accepted: continue
+            if mode == "Rejected" and accepted: continue
+            visible.append(event)
+            title = (f'{event["seconds"]:7.2f}s  {event["prediction"]}  '
+                     f'{event["best_score"]:.3f}' if event["best_score"] is not None else
+                     f'{event["seconds"]:7.2f}s  Unknown  --')
+            if truth is not None:
+                title += f'   [actual: {truth}]'
+            item = QListWidgetItem(title)
+            item.setData(Qt.UserRole, event["key"])
+            crop = event.get("crop")
+            if crop is not None and crop.size:
+                rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                h, w = rgb.shape[:2]
+                img = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format_RGB888).copy()
+                item.setIcon(QIcon(QPixmap.fromImage(img)))
+            self.history.addItem(item)
+        self.history.blockSignals(False)
+        scope = "Sample" if self.sample_keys is not None else "All"
+        self.summary.setText(f'{scope}: {len(visible)} shown · {len(app.review_events)} captured · '
+                             f'{len(app.review_labels)} saved assessments')
+        index = next((i for i, e in enumerate(visible) if e["key"] == selected), -1)
+        if index < 0 and visible: index = 0
+        if index >= 0:
+            self.history.setCurrentRow(index)
+            self.select_item(self.history.item(index))
+        else:
+            self.current_key = None
+            self.preview.clear()
+            self.details.clear()
+            self.decision.setText("Prediction: —")
+            self.score_summary.setText("Scores: —")
+
+    def show_all(self):
+        self.sample_keys = None
+        self.sample_video = None
+        self.refresh()
+
+    def generate_sample(self):
+        """Deterministic, time-spaced, stratified diagnostic sample.
+
+        Sampling never changes recognition predictions or their thresholds.
+        It operates on the currently retained review history (max 1000).
+        """
+        app = self.parent()
+        events = list(app.review_events)
+        if not events:
+            QMessageBox.information(self, "Recognition Test Session", "No detections captured yet. Run the video first.")
+            return
+        # Restrict to the most recent video's events, avoiding mixed sessions.
+        video = events[-1]["video"]
+        events = [e for e in events if e["video"] == video]
+        eligible = []
+        for event in events:
+            box = event.get("box") or ()
+            if len(box) != 4 or (box[2] - box[0]) < 80:
+                continue
+            eligible.append(event)
+        if not eligible:
+            QMessageBox.information(self, "Recognition Test Session", "No retained detections meet the 80 px minimum width.")
+            return
+        # Prefer a reproducible mix of accepted, unknown, borderline and
+        # ambiguous detections, then fill remaining slots from all eligible.
+        # The strata are diagnostic, not a statistically representative sample.
+        buckets = [[], [], [], []]
+        for e in eligible:
+            score = e.get("best_score")
+            margin = e.get("margin")
+            if margin is not None and margin < 0.06:
+                buckets[3].append(e)
+            elif score is not None and 0.50 <= score <= 0.60:
+                buckets[2].append(e)
+            elif e.get("prediction") != "Unknown":
+                buckets[0].append(e)
+            else:
+                buckets[1].append(e)
+        quotas = [30, 30, 25, 15]
+        rng = random.Random(20261121)
+        chosen = []
+        occupied = []
+        def add_candidate(e):
+            t = float(e["seconds"])
+            if any(abs(t - prior) < 1.0 for prior in occupied):
+                return False
+            chosen.append(e)
+            occupied.append(t)
+            return True
+        for bucket, quota in zip(buckets, quotas):
+            rng.shuffle(bucket)
+            added = 0
+            for e in bucket:
+                if added >= quota or len(chosen) >= 100:
+                    break
+                if add_candidate(e):
+                    added += 1
+        remaining = list(eligible)
+        rng.shuffle(remaining)
+        for e in remaining:
+            if len(chosen) >= 100:
+                break
+            add_candidate(e)
+        self.sample_keys = {e["key"] for e in chosen}
+        self.sample_video = video
+        self.current_key = None
+        self.filter_combo.setCurrentIndex(0)
+        self.refresh()
+        QMessageBox.information(self, "Recognition Test Session",
+            f"Selected {len(chosen)} detections from {len(eligible)} eligible retained faces.\n"
+            "Minimum width: 80 px; minimum spacing: 1 second; Unknown included.\n"
+            "The sample is diagnostic, not a population-random accuracy estimate.\n"
+            "Only the latest 1,000 captured detections are retained in this version.")
+
+    def select_item(self, current, previous=None):
+        if current is None: return
+        key = current.data(Qt.UserRole)
+        self.current_key = key
+        event = next((e for e in self.parent().review_events if e["key"] == key), None)
+        if event is None: return
+        crop = event.get("crop")
+        if crop is not None and crop.size:
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            img = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format_RGB888).copy()
+            self.preview.setPixmap(QPixmap.fromImage(img).scaled(180, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            self.preview.setText("Crop unavailable")
+        self.decision.setText(f'Prediction: {event["prediction"]}  ·  {event["seconds"]:.2f}s')
+        ranked = sorted(event["scores"], key=lambda x: x["score"], reverse=True)
+        self.score_summary.setText("Top scores: " + ("  |  ".join(
+            f'{e["reference"]}: {e["score"]:.3f}' for e in ranked[:4]) or "None"))
+        lines = [f'Video: {Path(event["video"]).name} · Frame: {event["frame"]}',
+                 f'Bounding box: {event["box"]}',
+                 f'Preprocessing: {event["mode"]} · Padding: {event["padding"]:.0%}',
+                 f'Best: {event["best_name"] or "N/A"} · Runner-up: {event["runner_up"] or "N/A"}',
+                 f'Margin: {event["margin"] if event["margin"] is not None else "N/A"}']
+        self.details.setPlainText("\n".join(lines))
+        self.populate_quick_buttons()
+
+    def reference_choices(self):
+        # Keep one button per reference image, in import order, even if several
+        # images belong to the same identity. Assessment still stores identity.
+        choices = []
+        for entry in self.parent().face_registry:
+            if not entry.get("included", True):
+                continue
+            label = entry.get("name") or "Unlabelled"
+            identity = entry.get("identity_name") or label
+            choices.append((label, identity, entry.get("crop")))
+        return choices
+
+    def populate_quick_buttons(self):
+        while self.quick_grid.count():
+            item = self.quick_grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        choices = self.reference_choices()
+        truth = self.parent().review_labels.get(self.current_key)
+        for index, (label, identity, crop) in enumerate(choices):
+            prefix = f"{index + 1} · " if index < 9 else ""
+            button = QPushButton(prefix + label)
+            button.setToolTip(f"Reference: {label} | Actual identity: {identity} | Shortcut: {index + 1}")
+            # A real icon on the native button avoids nested interactive Qt
+            # thumbnail widgets, which previously caused Windows crashes.
+            button.setMinimumHeight(92)
+            button.setIconSize(QSize(76, 76))
+            if crop is not None and getattr(crop, "size", 0):
+                rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                h, w = rgb.shape[:2]
+                image = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format_RGB888).copy()
+                pixmap = QPixmap.fromImage(image).scaled(
+                    76, 76, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                button.setIcon(QIcon(pixmap))
+            else:
+                button.setText(prefix + label + " (image unavailable)")
+            if truth == identity:
+                button.setStyleSheet("background:#236c61;border:1px solid #65d8c1;")
+            button.clicked.connect(lambda checked=False, value=identity: self.assess(value))
+            self.quick_grid.addWidget(button, index // 2, index % 2)
+        unknown = QPushButton("0 · Unknown / other person")
+        unknown.setMinimumHeight(37)
+        if truth == "Unknown":
+            unknown.setStyleSheet("background:#236c61;border:1px solid #65d8c1;")
+        unknown.clicked.connect(lambda: self.assess("Unknown"))
+        self.quick_grid.addWidget(unknown, (len(choices) + 1) // 2, 0, 1, 2)
+
+    def quick_key(self, digit):
+        if self.current_key is None:
+            return
+        if digit == 0:
+            self.assess("Unknown")
+        else:
+            choices = self.reference_choices()
+            if digit <= len(choices):
+                self.assess(choices[digit - 1][1])
+
+    def assess(self, identity):
+        if self.current_key is None:
+            return
+        row = self.history.currentRow()
+        self.parent().review_labels[self.current_key] = identity
+        self.parent().review_dirty = True
+        # In Unreviewed mode the current row disappears; selecting the same row
+        # naturally advances to the next detection. In other modes advance one.
+        if self.filter_combo.currentText() == "Unreviewed":
+            self.refresh()
+            if self.history.count():
+                self.history.setCurrentRow(min(max(row, 0), self.history.count() - 1))
+        else:
+            self.refresh()
+            if row + 1 < self.history.count():
+                self.history.setCurrentRow(row + 1)
+
+    def clear_truth(self):
+        if self.current_key is not None:
+            self.parent().review_labels.pop(self.current_key, None)
+            self.parent().review_dirty = True
+            self.refresh()
+
+    def export_csv(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Recognition Review", "asimov_recognition_review.csv", "CSV (*.csv)")
+        if not path: return
+        columns = ["video", "frame", "seconds", "box", "mode", "padding", "prediction",
+                   "best_name", "best_score", "runner_up", "margin", "actual_identity", "outcome", "reference_scores"]
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as output:
+                writer = csv.DictWriter(output, fieldnames=columns)
+                writer.writeheader()
+                for event in self.parent().review_events:
+                    truth = self.parent().review_labels.get(event["key"])
+                    row = {key: event.get(key, "") for key in columns}
+                    row["actual_identity"] = truth if truth is not None else ""
+                    row["outcome"] = ("unreviewed" if truth is None else
+                                      "correct" if truth == event["prediction"] else
+                                      "false_positive" if event["prediction"] != "Unknown" and truth == "Unknown" else
+                                      "missed_match" if event["prediction"] == "Unknown" else "wrong_identity")
+                    row["reference_scores"] = json.dumps(event["scores"], ensure_ascii=False)
+                    writer.writerow(row)
+        except OSError as exc:
+            QMessageBox.warning(self, "Export failed", str(exc))
+
+    def save_labels(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Review Assessments", "asimov_review_labels.json", "JSON (*.json)")
+        if not path: return
+        try:
+            with open(path, "w", encoding="utf-8") as output:
+                json.dump({"version": 1, "labels": self.parent().review_labels}, output, indent=2, ensure_ascii=False)
+        except OSError as exc:
+            QMessageBox.warning(self, "Save failed", str(exc))
+
+    def load_labels(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load Review Assessments", "", "JSON (*.json)")
+        if not path: return
+        try:
+            with open(path, encoding="utf-8") as source:
+                data = json.load(source)
+            labels = data.get("labels", {})
+            if not isinstance(labels, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in labels.items()):
+                raise ValueError("Invalid assessment file")
+            self.parent().review_labels.update(labels)
+            self.refresh()
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            QMessageBox.warning(self, "Load failed", str(exc))
+
+
 class BasicVideoApp(QMainWindow):
 
     def __init__(self):
@@ -918,6 +1340,10 @@ class BasicVideoApp(QMainWindow):
         self.performance_empty_count = 0
         self.gui_delay_ms = 0.0
         self.performance_monitor = None
+        self.recognition_review = None
+        self.review_events = deque(maxlen=1000)
+        self.review_labels = {}
+        self.review_dirty = False
         self.recognized_refresh_dirty = False
 
         # Build Qt UI before starting the worker.
@@ -1221,6 +1647,9 @@ class BasicVideoApp(QMainWindow):
         self.recognized_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.recognized_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.recognized_strip_widget = QWidget()
+        # QScrollArea with widgetResizable=False needs an explicit content height.
+        # Otherwise Qt can leave the content at zero height: scrollbar moves, tiles invisible.
+        self.recognized_strip_widget.setFixedHeight(88)
         self.recognized_strip_layout = QHBoxLayout(self.recognized_strip_widget)
         self.recognized_strip_layout.setContentsMargins(6, 2, 6, 2)
         self.recognized_strip_layout.setSpacing(6)
@@ -1448,8 +1877,8 @@ class BasicVideoApp(QMainWindow):
         # Explicit content width exposes the native horizontal scrollbar.
         count = len(self.recent_recognitions)
         content_width = 12 + count * 71 + max(0, count - 1) * 6
-        self.recognized_strip_widget.setFixedWidth(max(
-            self.recognized_scroll.viewport().width(), content_width))
+        self.recognized_strip_widget.setFixedSize(max(
+            self.recognized_scroll.viewport().width(), content_width), 88)
         if follow_latest:
             scrollbar.setValue(scrollbar.maximum())
         else:
@@ -1638,6 +2067,10 @@ class BasicVideoApp(QMainWindow):
         monitor_action.setShortcut("Ctrl+M")
         monitor_action.triggered.connect(self.open_performance_monitor)
         monitor_menu.addAction(monitor_action)
+        review_action = QAction("Recognition Review...", self)
+        review_action.setShortcut("Ctrl+R")
+        review_action.triggered.connect(self.open_recognition_review)
+        monitor_menu.addAction(review_action)
         reset_metrics_action = QAction("Reset Performance Metrics", self)
         reset_metrics_action.triggered.connect(self.reset_performance_metrics)
         monitor_menu.addAction(reset_metrics_action)
@@ -2204,6 +2637,34 @@ class BasicVideoApp(QMainWindow):
         )
         print(f"Detection error: {message}")
 
+    def open_recognition_review(self):
+        if self.recognition_review is None:
+            self.recognition_review = RecognitionReview(self)
+        self.recognition_review.refresh()
+        self.recognition_review.show()
+        self.recognition_review.raise_()
+        self.recognition_review.activateWindow()
+
+    def capture_review_event(self, detection, frame_number):
+        if not self.video_path: return
+        box = tuple(detection.get("box") or ())
+        # Stable key across repeated runs, independent of preprocessing mode.
+        key = json.dumps([str(Path(self.video_path).resolve()), int(frame_number), list(box)], separators=(",", ":"))
+        crop = detection.get("review_crop")
+        if crop is not None and crop.size:
+            crop = crop.copy()
+        event = {
+            "key": key, "video": str(Path(self.video_path).resolve()), "frame": int(frame_number),
+            "seconds": frame_number / self.video_fps if self.video_fps else 0.0,
+            "box": box, "crop": crop, "mode": self.crop_mode, "padding": self.crop_padding,
+            "prediction": detection.get("name") or "Unknown",
+            "best_name": detection.get("best_name"), "best_score": detection.get("best_score"),
+            "runner_up": detection.get("runner_up_name"), "margin": detection.get("score_margin"),
+            "scores": detection.get("reference_scores") or [],
+        }
+        self.review_events.append(event)
+        self.review_dirty = True
+
     def on_detection_ready(
         self,
         detections,
@@ -2255,6 +2716,7 @@ class BasicVideoApp(QMainWindow):
                                 metadata={"face_width": max(0,x2-x1), "face_height": max(0,y2-y1),
                                           "detection_confidence": detection["probability"]})
             if self.recognition_checkbox.isChecked():
+                self.capture_review_event(detection, frame_number)
                 score = detection.get("best_score")
                 score_text = f"{score:.3f}" if score is not None else "N/A"
                 accepted = bool(detection.get("name") and detection["name"] != "Unknown")
